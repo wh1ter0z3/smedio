@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Smedio
+Comment=YouTube and live TV — ad-free, hardware-decoded
+Exec=smedio
+Icon=dev.smedio.Smedio
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=youtube;video;tv;iptv;m3u;mpv;shorts;
+StartupNotify=true
+StartupWMClass=dev.smedio.Smedio
