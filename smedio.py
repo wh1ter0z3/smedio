@@ -121,6 +121,7 @@ PAGE = 24
 LIST_FIRST = 72   # cards shown at first on long lists; more as you scroll
 QUEUE_MAX = 200   # videos lined up after the one you click in a list
 THUMB_W, THUMB_H = 240, 135
+GRID_COLUMNS = ((None, 499, 1), (500, 749, 2), (750, 1099, 3))  # page width (px) -> cards a row; wider: 4
 SHORT_W, SHORT_H = 162, 288
 RESOLVE_TTL = 20 * 60   # stream URLs stay valid for hours; keep lookups for 20 min
 PREVIEW_TTL = 60 * 60
@@ -1884,30 +1885,41 @@ class Downloads:
 
 
 class Thumb(Gtk.Picture):
-    """Fixed-size thumbnail, so cards never resize when images arrive."""
+    """Fixed-size thumbnail, so cards never resize when images arrive. A fluid one keeps the
+    w:h shape but takes the width it is given (the YouTube-style grid)."""
 
-    def __init__(self, w, h):
+    def __init__(self, w, h, fluid=False):
         super().__init__(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
-        self._w, self._h = w, h
+        self._w, self._h, self._fluid = w, h, fluid
         self.add_css_class('tl-thumb')
 
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH if self._fluid else Gtk.SizeRequestMode.CONSTANT_SIZE
+
     def do_measure(self, orientation, for_size):
-        size = self._w if orientation == Gtk.Orientation.HORIZONTAL else self._h
+        if not self._fluid:
+            size = self._w if orientation == Gtk.Orientation.HORIZONTAL else self._h
+            return size, size, -1, -1
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return self._w // 2, self._w, -1, -1
+        size = round((for_size if for_size > 0 else self._w) * self._h / self._w)
         return size, size, -1, -1
 
 
 class Card(Gtk.FlowBoxChild):
-    def __init__(self, video, win, page=None, vertical=False):
-        super().__init__(halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
+    def __init__(self, video, win, page=None, vertical=False, fluid=False):
+        live = video.kind == 'live'
+        # fluid: 16:9 cards as wide as the grid's column (channel logos and Shorts keep their size)
+        self.fluid = fluid and not (live or vertical)
+        super().__init__(halign=Gtk.Align.FILL if self.fluid else Gtk.Align.CENTER, valign=Gtk.Align.START)
         self.video, self.win, self.page, self.vertical = video, win, page, vertical
         self.texture = None
         self._hover = False
         self.add_css_class('tl-card')
         self.set_tooltip_text(video.title)
 
-        live = video.kind == 'live'
         self.thumb = Thumb(*((LIVE_W, LIVE_H) if live else
-                             (SHORT_W, SHORT_H) if vertical else (THUMB_W, THUMB_H)))
+                             (SHORT_W, SHORT_H) if vertical else (THUMB_W, THUMB_H)), fluid=self.fluid)
         if video.kind in ('channel', 'live'):
             self.thumb.set_content_fit(Gtk.ContentFit.CONTAIN)
         if live:
@@ -2083,6 +2095,25 @@ def cache_drop(folder, key):
         pass
 
 
+class GridFlow(Gtk.FlowBox):
+    """The card grid. With fluid cards (YouTube's 16:9 ones) it shows `columns` cards a row,
+    stretched to the row's width, like YouTube; otherwise as many fixed-size cards as fit."""
+    columns = GObject.Property(type=int, default=4)
+
+    def __init__(self, **kw):
+        super().__init__(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
+                         activate_on_single_click=True, **kw)
+        self.fluid = False
+        self.connect('notify::columns', lambda *_: self.set_fluid(self.fluid))
+        self.set_fluid(False)
+
+    def set_fluid(self, fluid):
+        self.fluid = fluid
+        n = self.props.columns
+        self.set_min_children_per_line(n if fluid else 1)
+        self.set_max_children_per_line(n if fluid else 14)
+
+
 class GridPage(Adw.NavigationPage):
     """A titled, scrollable grid of cards filled by `fetch` in the background. With `cache_key`
     (a string, or a function for pages with filters) the result is saved on disk and shown from
@@ -2118,10 +2149,8 @@ class GridPage(Adw.NavigationPage):
         heading.append(refresh)
         self.connect('showing', lambda *_: self._show_age())
 
-        self.flow = Gtk.FlowBox(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
-                                activate_on_single_click=True, max_children_per_line=14,
-                                column_spacing=6, row_spacing=10, valign=Gtk.Align.START,
-                                margin_start=12, margin_end=12, margin_top=4, margin_bottom=12)
+        self.flow = GridFlow(column_spacing=6, row_spacing=10, valign=Gtk.Align.START,
+                             margin_start=12, margin_end=12, margin_top=4, margin_bottom=12)
         self.flow.connect('child-activated', lambda _f, card: win.activate_card(card))
         self.more_spinner = Adw.Spinner(width_request=32, height_request=32, margin_bottom=24, visible=False)
         self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2141,7 +2170,13 @@ class GridPage(Adw.NavigationPage):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.append(heading)
         outer.append(self.stack)
-        self.set_child(outer)
+        bin_ = Adw.BreakpointBin(child=outer, width_request=300, height_request=200)
+        for lo, hi, n in GRID_COLUMNS:
+            cond = ' and '.join(c for c in (lo and f'min-width: {lo}px', hi and f'max-width: {hi}px') if c)
+            bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(cond))
+            bp.add_setter(self.flow, 'columns', n)
+            bin_.add_breakpoint(bp)
+        self.set_child(bin_)
         self.reload()
 
     def reload(self, force=False):
@@ -2212,10 +2247,11 @@ class GridPage(Adw.NavigationPage):
             if video.id in self.ids or video.id in hidden_v or (video.channel_id and video.channel_id in hidden_c):
                 continue
             self.ids.add(video.id)
-            card = Card(video, self.win, self, self.vertical)
+            card = Card(video, self.win, self, self.vertical, fluid=True)
             self.cards.append(card)
             self.flow.append(card)
             self.win.load_thumb(card)
+        self.flow.set_fluid(bool(self.cards) and all(c.fluid for c in self.cards))
 
     def remove_card(self, card):
         if card in self.cards:
