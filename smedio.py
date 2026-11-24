@@ -542,6 +542,32 @@ def fmt_age(ts):
     return 'just now'
 
 
+AGE_UNITS = {'s': 'second', 'sec': 'second', 'm': 'minute', 'min': 'minute', 'h': 'hour', 'hr': 'hour',
+             'd': 'day', 'w': 'week', 'wk': 'week', 'mo': 'month', 'y': 'year', 'yr': 'year'}
+
+
+def youtube_age(text):
+    """YouTube's short ages, spelled out as on its pages: '3mo ago' -> '3 months ago',
+    'Streamed 1d ago' -> 'Streamed 1 day ago'. Anything else is left as it is."""
+    m = re.match(r'^(.*?)(\d+)\s*([a-z]+)\s+ago$', text or '')
+    unit = AGE_UNITS.get(m.group(3)) if m else None
+    if not unit:
+        return text
+    n = int(m.group(2))
+    return f'{m.group(1)}{n} {unit}{"s" if n != 1 else ""} ago'
+
+
+def date_age(yyyymmdd):
+    """'20261115' -> '9 days ago' (YouTube's day-precise upload date)."""
+    days = (datetime.now().date() - datetime.strptime(yyyymmdd, '%Y%m%d').date()).days
+    if days <= 0:
+        return 'today'
+    for unit, size in (('year', 365), ('month', 30), ('week', 7), ('day', 1)):
+        if days >= size:
+            n = days // size
+            return f'{n} {unit}{"s" if n != 1 else ""} ago'
+
+
 def fmt_size(n):
     if not n:
         return '?'
@@ -677,7 +703,7 @@ class Video:
             bits.append(f'{fmt_count(self.views)} views')
         elif self.views_text:
             bits.append(self.views_text if re.search(r'[a-z]{3,}', self.views_text) else f'{self.views_text} views')
-        age = fmt_age(self.published) if self.published else self.age
+        age = fmt_age(self.published) if self.published else youtube_age(self.age)
         if age:
             bits.append(age)
         return ' · '.join(b for b in bits if b)
@@ -2170,11 +2196,18 @@ class Card(Gtk.FlowBoxChild):
                          max_width_chars=1, hexpand=True)
         meta.add_css_class('dim-label')
         meta.add_css_class('caption')
-        if row:  # thumbnail on the left, the text beside it (Up next)
-            meta.set_properties(wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2)
-            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.START)
+        if row:  # thumbnail on the left, the text beside it (Up next): a big title, channel, views · age
+            title.set_lines(3)
+            channel, _, stats_text = video.meta().partition(' · ')
+            meta.set_label(channel)
+            meta.remove_css_class('caption')
+            stats = Gtk.Label(label=stats_text, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=1,
+                              hexpand=True, visible=bool(stats_text), css_classes=['dim-label'])
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.START)
             text.append(title)
+            meta.set_margin_top(4)
             text.append(meta)
+            text.append(stats)
             box = Gtk.Grid(column_homogeneous=True, column_spacing=10)  # thumbnail 7/12, text 5/12
             box.attach(overlay, 0, 0, 7, 1)
             box.attach(text, 7, 0, 5, 1)
@@ -3482,7 +3515,7 @@ class WatchPage(Adw.NavigationPage):
         self.show_side(False)
         if video.kind == 'file':  # a downloaded file: nothing to look up online
             title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
-            title.add_css_class('title-3')
+            title.add_css_class('tl-watch-title')
             self.info.append(title)
             return
         if video.kind == 'live':
@@ -3490,7 +3523,7 @@ class WatchPage(Adw.NavigationPage):
             return
 
         title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
-        title.add_css_class('title-3')
+        title.add_css_class('tl-watch-title')
         self.info.append(title)
         self.title_label = title
 
@@ -3581,8 +3614,10 @@ class WatchPage(Adw.NavigationPage):
             bits = [f'{fmt_count(meta["views"])} views' if meta.get('views') else None,
                     f'👍 {fmt_count(meta["likes"])}' if meta.get('likes') else None]
             if meta.get('upload_date'):
-                try:
-                    bits.append(datetime.strptime(meta['upload_date'], '%Y%m%d').strftime('%d %b %Y'))
+                try:  # '9 days ago', the date itself on hover (as on YouTube)
+                    bits.append(date_age(meta['upload_date']))
+                    self.meta_label.set_tooltip_text(
+                        datetime.strptime(meta['upload_date'], '%Y%m%d').strftime('Uploaded %d %B %Y'))
                 except ValueError:
                     pass
             if meta.get('followers'):
@@ -3707,7 +3742,7 @@ class WatchPage(Adw.NavigationPage):
         win, nl, gen = self.win, self.win.now_live, self._gen
         self.show_meta = self._start_details = None
         title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
-        title.add_css_class('title-3')
+        title.add_css_class('tl-watch-title')
         self.title_label = title
         src = (win.live_index.get(video.id) or {}).get('source')
         source = next((pl['name'] for pl in win.config['iptv'] if pl['url'] == src), 'IPTV')
@@ -4537,6 +4572,8 @@ CSS = f"""
 flowboxchild.tl-card {{ padding: 6px; border-radius: 14px; }}
 flowboxchild.tl-card:hover {{ background-color: alpha(currentColor, 0.06); }}
 flowboxchild.tl-row {{ padding: 4px; border-radius: 10px; }}
+flowboxchild.tl-row .tl-title {{ font-size: 1.2em; font-weight: 700; line-height: 1.2; }}
+.tl-watch-title {{ font-size: 1.7em; font-weight: 800; line-height: 1.25; }}
 
 /* 2012-style player */
 .tl-player {{ background-color: black; border-radius: 12px; }}
