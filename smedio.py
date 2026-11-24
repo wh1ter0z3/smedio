@@ -126,6 +126,8 @@ GRID_COLUMNS = ((None, 499, 1), (500, 749, 2), (750, 1099, 3))  # page width (px
 # The watch page fits itself to the screen (see WatchColumns): Up next's thumbnails are as tall as
 # lets about UPNEXT_ROWS rows show, its column is as wide as they need (at most UPNEXT_SHARE of the
 # page), and the player takes the rest, at most PLAYER_VH of the visible height.
+COMMENTS_PAGE = 20       # comments shown at first and added by "Load more comments"
+UPNEXT_PAGE = 10         # Up next videos shown at first and added by "Show more videos"
 ROW_W, ROW_H = 288, 162   # Up next thumbnail: its 16:9 shape and natural size; it scales
 UPNEXT_ROWS, UPNEXT_SHARE, PLAYER_VH = 5.5, 0.36, 0.8
 WATCH_GAP = 28            # between the player column and Up next
@@ -1014,9 +1016,10 @@ class YouTube:
             elif kind == 'details':
                 # Comments don't need stream URLs: skipping the player JS (and its Deno solver)
                 # cuts this lookup to about a third of the CPU.
+                n = str(fmt or COMMENTS_PAGE)  # 'fmt' carries how many comments to fetch
                 opts.update(format='b/bv*/ba', getcomments=True, ignore_no_formats_error=True,
-                            extractor_args={'youtube': {'max_comments': ['40', '40', '0', '0'],
-                                                        'comment_sort': ['top'], 'player_skip': ['js'],
+                            extractor_args={'youtube': {'max_comments': [n, n, '0', '0'],
+                                                        'comment_sort': ['new'], 'player_skip': ['js'],
                                                         'player_client': ['web']}})
             else:
                 opts['format'] = fmt
@@ -1163,9 +1166,11 @@ class YouTube:
                         break
         return out
 
-    def details(self, video_id):
-        info = self._extract(self._ydl('details'), f'https://www.youtube.com/watch?v={video_id}')
-        comments = [{'author': c.get('author') or '', 'text': c.get('text') or '', 'likes': c.get('like_count'),
+    def details(self, video_id, count=None):
+        """The video's details and its newest `count` comments (newest first, pinned ones on top)."""
+        info = self._extract(self._ydl('details', count or COMMENTS_PAGE), f'https://www.youtube.com/watch?v={video_id}')
+        comments = [{'id': c.get('id'), 'author': c.get('author') or '', 'text': c.get('text') or '',
+                     'likes': c.get('like_count'),
                      'time': c.get('_time_text') or '', 'pinned': c.get('is_pinned'),
                      'uploader': c.get('author_is_uploader')}
                     for c in info.get('comments') or [] if c.get('parent') in (None, 'root')]
@@ -3036,7 +3041,11 @@ class WatchPage(Adw.NavigationPage):
         self.related.connect('child-activated', lambda _f, card: win.activate_card(card))
         self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.START,
                             margin_bottom=24, visible=False)
-        for w in (self.side_title, self.side_spinner, self.related):
+        self.side_more = Gtk.Button(label='Show more videos', visible=False, halign=Gtk.Align.CENTER, margin_top=4)
+        self.side_more.add_css_class('pill')
+        self._side_more_cb = None
+        self.side_more.connect('clicked', lambda *_: self._side_more_cb and self._side_more_cb())
+        for w in (self.side_title, self.side_spinner, self.related, self.side_more):
             self.side.append(w)
         self._side_on = False
         self.columns = WatchColumns(self, self.body, self.side)
@@ -3512,6 +3521,8 @@ class WatchPage(Adw.NavigationPage):
             self.info.remove(child)
         self.related.remove_all()
         self.side_spinner.set_visible(False)
+        self.side_more.set_visible(False)
+        self._side_more_cb = None
         self.show_side(False)
         if video.kind == 'file':  # a downloaded file: nothing to look up online
             title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
@@ -3579,6 +3590,9 @@ class WatchPage(Adw.NavigationPage):
         self.info.append(comments_hint)
         self.comments = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         self.info.append(self.comments)
+        more_comments = Gtk.Button(label='Load more comments', visible=False, halign=Gtk.Align.START)
+        more_comments.add_css_class('pill')
+        self.info.append(more_comments)
 
         def related_work():
             try:
@@ -3587,20 +3601,62 @@ class WatchPage(Adw.NavigationPage):
                 items = []
             idle(show_related, items)
 
+        rel = {'queue': [], 'known': {video.id}, 'seeds': {video.id}, 'shown': []}
+
+        def add_card(v):
+            if gen == self._gen:
+                card = Card(v, win, row=True)
+                self.related.append(card)
+                win.load_thumb(card)
+
+        def more_related(items=()):
+            """Queue new videos from `items`, show the next UPNEXT_PAGE; False if nothing was left."""
+            hidden_v, _ = lib.hidden()
+            for v in items:
+                if v.id not in rel['known'] and v.id not in hidden_v and v.kind == 'video':
+                    rel['known'].add(v.id)
+                    rel['queue'].append(v)
+            batch, rel['queue'] = rel['queue'][:UPNEXT_PAGE], rel['queue'][UPNEXT_PAGE:]
+            rel['shown'] += batch
+            in_batches(batch, add_card)
+            return bool(batch)
+
+        def show_more_videos():
+            if rel['queue']:
+                more_related()
+                return
+            seed = next((v for v in rel['shown'] if v.id not in rel['seeds']), None)
+            if seed is None:
+                self.side_more.set_visible(False)
+                return
+            rel['seeds'].add(seed.id)
+            self.side_more.set_sensitive(False)
+            self.side_more.set_label('Loading…')
+
+            def work():  # YouTube's next page: what it relates to a video already shown
+                try:
+                    items = win.yt.related(seed.id)
+                except Exception:  # noqa: BLE001
+                    items = []
+                idle(done, items)
+
+            def done(items):
+                if gen != self._gen:
+                    return
+                self.side_more.set_sensitive(True)
+                self.side_more.set_label('Show more videos')
+                if not more_related(items):
+                    show_more_videos()  # all known already: try the next seed
+
+            win.feed_pool.submit(work)
+
         def show_related(items):
             if gen != self._gen:
                 return
             self.side_spinner.set_visible(False)
-            hidden_v, _ = lib.hidden()
-            self.show_side(any(v.id not in hidden_v for v in items))
-
-            def add_card(v):
-                if gen == self._gen:
-                    card = Card(v, win, row=True)
-                    self.related.append(card)
-                    win.load_thumb(card)
-
-            in_batches([v for v in items[:18] if v.id not in hidden_v], add_card)
+            self.show_side(more_related(items))
+            self._side_more_cb = show_more_videos
+            self.side_more.set_visible(bool(rel['shown']))
 
         def show_meta(meta):
             if gen != self._gen:
@@ -3633,18 +3689,33 @@ class WatchPage(Adw.NavigationPage):
         if self.stream and self.stream.get('meta'):
             show_meta(self.stream['meta'])
 
-        def details_work():
+        com = {'count': COMMENTS_PAGE, 'ids': set()}
+
+        def details_work(count=COMMENTS_PAGE):
             try:
-                d = win.yt.details(video.id)
+                d = win.yt.details(video.id, count)
                 idle(show_comments, d, None)
             except Exception as e:  # noqa: BLE001
                 idle(show_comments, None, clean_error(e))
+
+        def load_more_comments(_b=None):
+            com['count'] += COMMENTS_PAGE
+            more_comments.set_sensitive(False)
+            more_comments.set_label('Loading…')
+            win.search_pool.submit(details_work, com['count'])
+
+        more_comments.connect('clicked', load_more_comments)
 
         def show_comments(d, error):
             if gen != self._gen:
                 return
             comments_spinner.set_visible(False)
+            more_comments.set_sensitive(True)
+            more_comments.set_label('Load more comments')
             if error:
+                if com['ids']:  # a failed "load more": keep what is shown, let it be tried again
+                    win.toast(f'Couldn’t load more comments: {error}')
+                    return
                 self.comments_label.set_label('Comments unavailable')
                 return
             v = d['video']
@@ -3654,7 +3725,7 @@ class WatchPage(Adw.NavigationPage):
                 self.set_title(v.title)
             show_meta({'views': v.views, 'likes': d.get('likes'), 'upload_date': d.get('upload_date'),
                        'followers': d.get('followers'), 'description': d.get('description'),
-                       'comment_count': d.get('comment_count'), 'channel': v.channel, 'channel_id': v.channel_id,
+                       'channel': v.channel, 'channel_id': v.channel_id,  # (its comment_count = comments fetched)
                        'channel_url': v.channel_url, 'duration': v.duration})
 
             def add_comment(c):
@@ -3671,9 +3742,14 @@ class WatchPage(Adw.NavigationPage):
                                       wrap_mode=Pango.WrapMode.WORD_CHAR))
                 self.comments.append(item)
 
-            in_batches(d['comments'], add_comment, 4)
-            if not d['comments']:
+            first = not com['ids']
+            new = [c for c in d['comments'] if (c['id'] or c['text']) not in com['ids']]
+            com['ids'].update(c['id'] or c['text'] for c in new)
+            in_batches(new, add_comment, 4)
+            if first and not d['comments']:
                 self.comments.append(Gtk.Label(label='No comments to show.', xalign=0, css_classes=['dim-label']))
+            # more to come if YouTube gave as many as asked for (yt-dlp's comment_count is only what it fetched)
+            more_comments.set_visible(bool(new) and len(d['comments']) >= com['count'])
 
         # Nothing extra while the video starts (that is when frames get dropped): Up next after
         # a few seconds; comments (a second full YouTube lookup) only when you scroll down to them.
