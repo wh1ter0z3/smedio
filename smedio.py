@@ -46,7 +46,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime
 
 APP_ID = 'dev.smedio.Smedio'
-VERSION = '3.4'
+VERSION = '3.4.1'
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 VENV_BIN = os.path.join(APP_DIR, 'venv', 'bin')
 BUNDLED_LIBMPV = os.path.join(APP_DIR, 'lib', 'libmpv.so.2')
