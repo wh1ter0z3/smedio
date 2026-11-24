@@ -2903,7 +2903,14 @@ class WatchColumns(Gtk.Widget):
         smin, snat = self.side.measure(orientation, side)[:2]
         if self.below:
             return bmin + WATCH_GAP + smin, bnat + WATCH_GAP + snat, -1, -1
-        return max(bmin, smin), max(bnat, snat), -1, -1
+        top = self._top(side)
+        return max(bmin + top, smin), max(bnat + top, snat), -1, -1
+
+    def _top(self, side):
+        """How far down the first Up next thumbnail starts (below its heading): the player column
+        starts there too, so the two line up."""
+        title = self.page.side_title
+        return title.measure(Gtk.Orientation.VERTICAL, side)[1] + self.side.get_spacing() + 4  # + row padding
 
     @staticmethod
     def _place(child, x, y, w, h):
@@ -2918,7 +2925,8 @@ class WatchColumns(Gtk.Widget):
             self._place(self.body, x, 0, body, bh)
             self._place(self.side, x, bh + WATCH_GAP, side, max(1, height - bh - WATCH_GAP))
         else:
-            self._place(self.body, x, 0, body, height)
+            top = self._top(side)
+            self._place(self.body, x, top, body, max(1, height - top))
             self._place(self.side, x + body + WATCH_GAP, 0, side, height)
 
     def do_dispose(self):
