@@ -3049,8 +3049,10 @@ class WatchPage(Adw.NavigationPage):
             self.side.append(w)
         self._side_on = False
         self.columns = WatchColumns(self, self.body, self.side)
-        self.clamp = Adw.Clamp(maximum_size=100000, child=self.columns, margin_start=12, margin_end=12,
-                               margin_top=8)  # WatchColumns sizes and centres everything
+        self.clamp = Adw.Clamp(maximum_size=100000, tightening_threshold=100000, child=self.columns,
+                               margin_start=12, margin_end=12, margin_top=8)
+        # WatchColumns sizes and centres everything; without the threshold the clamp's easing kept
+        # the content a pixel short of each side (light lines beside the fullscreen video)
         self.scroller = Gtk.ScrolledWindow(child=self.clamp, hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.scroller.get_vadjustment().connect(
             'notify::page-size', lambda adj, _p: self.columns.viewport_changed(adj.get_page_size()))
