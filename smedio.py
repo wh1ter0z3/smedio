@@ -214,8 +214,9 @@ def video_format(height, playback=True):
 AUDIO_FORMAT = 'ba[ext=m4a]/ba/b'
 # Which YouTube apps yt-dlp poses as when asking for stream links. YouTube keeps changing which
 # ones it refuses (403 Forbidden, e.g. tv_samsung in Nov 2026), so every lookup tests its link and
-# moves down this list when refused; the set that worked is tried first next time.
-YT_CLIENTS = [['visionos', 'web_embedded'], ['default'], ['tv_simply', 'web_safari'], ['mweb']]
+# moves down this list when refused; the set that worked is tried first next time. visionos alone
+# needs no player JS (no Deno challenge): ~1.5 s a lookup instead of ~5 s with web_embedded.
+YT_CLIENTS = [['visionos'], ['visionos', 'web_embedded'], ['default'], ['tv_simply', 'web_safari'], ['mweb']]
 YT_CLIENTS_ARG = 'youtube:player_client=visionos,web_embedded'  # for yt-dlp run as a command
 
 
@@ -969,6 +970,7 @@ class YouTube:
         return info.get('channel_id'), info.get('channel') or info.get('uploader')
 
     clients_ok = 0  # index in YT_CLIENTS of the set that last gave working links (per process)
+    clients_ok_since = 0.0  # when a slower set took over; the fast first one is tried again later
 
     @staticmethod
     def _link_ok(f):
@@ -988,6 +990,8 @@ class YouTube:
     def resolve(self, video_id, fmt):
         """Direct stream URLs for mpv: {url, audio, title, ua, formats}."""
         url, error = f'https://www.youtube.com/watch?v={video_id}', None
+        if YouTube.clients_ok and time.monotonic() - YouTube.clients_ok_since > 10 * 60:
+            YouTube.clients_ok = 0  # one video the fast set couldn't do shouldn't slow all the rest
         first = YouTube.clients_ok
         for i in list(range(first, len(YT_CLIENTS))) + list(range(first)):
             try:
@@ -998,9 +1002,11 @@ class YouTube:
             parts = info.get('requested_formats') or [info]
             video = next((f for f in parts if f.get('vcodec') not in (None, 'none')), parts[0])
             audio = next((f for f in parts if f is not video), None)
-            if self._link_ok(video) and (audio is None or self._link_ok(audio)):
-                YouTube.clients_ok = i
-                break
+            with ThreadPoolExecutor(2) as probe:  # both links at once
+                if all(probe.map(self._link_ok, [f for f in (video, audio) if f is not None])):
+                    if i != YouTube.clients_ok:
+                        YouTube.clients_ok, YouTube.clients_ok_since = i, time.monotonic()
+                    break
             error = RuntimeError('YouTube refused the stream (403 Forbidden)')
         else:
             raise error
