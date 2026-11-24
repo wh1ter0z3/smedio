@@ -2967,7 +2967,7 @@ class WatchPage(Adw.NavigationPage):
         self.fs_title.add_css_class('tl-fs-title')
         self.top = Gtk.Revealer(child=self.fs_title, reveal_child=False, valign=Gtk.Align.START,
                                 transition_type=Gtk.RevealerTransitionType.CROSSFADE, can_target=False)
-        self.player = Gtk.Overlay(child=self.area)
+        self.player = Gtk.Overlay(child=self.area, overflow=Gtk.Overflow.HIDDEN)  # clips to the rounded corners
         self.player.add_css_class('tl-player')
         self.stats = StatsPanel(self)
         for w in (self.top, self.spinner, self.buffer_label, self.revealer, self.stats):
@@ -3196,6 +3196,7 @@ class WatchPage(Adw.NavigationPage):
         self.info.set_visible(not on)
         self.area.fill = on
         self.area.set_vexpand(on)
+        (self.player.add_css_class if on else self.player.remove_css_class)('fullscreen')  # square corners
         self.show_side(self._side_on)
         for side in ('start', 'end', 'top'):
             getattr(self.clamp, f'set_margin_{side}')(0 if on else (8 if side == 'top' else 12))
@@ -4538,7 +4539,8 @@ flowboxchild.tl-card:hover {{ background-color: alpha(currentColor, 0.06); }}
 flowboxchild.tl-row {{ padding: 4px; border-radius: 10px; }}
 
 /* 2012-style player */
-.tl-player {{ background-color: black; border-radius: 0; }}
+.tl-player {{ background-color: black; border-radius: 12px; }}
+.tl-player.fullscreen {{ border-radius: 0; }}
 .tl-player-bar {{ background-image: linear-gradient(to bottom, rgba(0,0,0,0), rgba(0,0,0,0.75) 35%, rgba(0,0,0,0.92));
                  padding: 14px 6px 2px 6px; color: #d8d8d8; }}
 .tl-progress {{ padding: 6px 0; margin: 0 2px; }}
