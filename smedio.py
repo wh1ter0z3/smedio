@@ -45,7 +45,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime
 
 APP_ID = 'dev.smedio.Smedio'
-VERSION = '3.0'
+VERSION = '3.1'
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 VENV_BIN = os.path.join(APP_DIR, 'venv', 'bin')
 BUNDLED_LIBMPV = os.path.join(APP_DIR, 'lib', 'libmpv.so.2')
@@ -77,6 +77,46 @@ DEFAULT_DOWNLOAD_DIR = os.path.join(
 
 QUALITIES = [360, 480, 720, 1080]
 SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+# The YouTube captions language the viewer picked last (a YouTube code like 'en'; '' = off). The
+# players add that track to every YouTube video that has it.
+CAPTION_PREF = ''
+
+
+def yt_captions(info):
+    """Captions YouTube has for a video, from yt-dlp's info: subtitles uploaded with it in every
+    language, and the automatic ones in the video's own language and in English.
+    Each is {lang, name, url, auto}; nothing is downloaded until one is picked."""
+    def vtt(fmts):
+        f = next((f for f in fmts or [] if f.get('ext') == 'vtt' and f.get('url')), None)
+        return f['url'] if f else None
+
+    out, seen = [], set()
+    for lang, fmts in sorted((info.get('subtitles') or {}).items()):
+        url = vtt(fmts)
+        if lang == 'live_chat' or not url:
+            continue
+        out.append({'lang': lang, 'name': (fmts[0].get('name') or lang), 'url': url, 'auto': False})
+        seen.add(lang)
+    auto = info.get('automatic_captions') or {}
+    for code in [c for c in auto if c.endswith('-orig')] + ['en']:
+        lang = code[:-5] if code.endswith('-orig') else code
+        url = vtt(auto.get(code))
+        if lang in seen or not url:
+            continue
+        name = auto[code][0].get('name') or lang
+        out.append({'lang': lang, 'name': name if 'auto' in name.lower() else f'{name} (auto-generated)',
+                    'url': url, 'auto': True})
+        seen.add(lang)
+    return out
+
+
+def pick_caption(stream):
+    """The caption track to load with this stream, by CAPTION_PREF, or None."""
+    if not CAPTION_PREF:
+        return None
+    caps = (stream or {}).get('captions') or []
+    return next((c for c in caps if c['lang'] == CAPTION_PREF), None) or \
+        next((c for c in caps if c['lang'].split('-')[0] == CAPTION_PREF.split('-')[0]), None)
 PAGE = 24
 LIST_FIRST = 72   # cards shown at first on long lists; more as you scroll
 QUEUE_MAX = 200   # videos lined up after the one you click in a list
@@ -952,7 +992,7 @@ class YouTube:
                          'description': info.get('description') or '', 'comment_count': info.get('comment_count'),
                          'channel': info.get('channel') or info.get('uploader'), 'channel_id': info.get('channel_id'),
                          'channel_url': info.get('channel_url'), 'duration': info.get('duration')},
-                'preview': preview['url'] if preview else None}
+                'preview': preview['url'] if preview else None, 'captions': yt_captions(info)}
 
     def moving_thumbs(self, query):
         """YouTube's animated 3-second thumbnails for a search ({video id: webp url}); ~50 KB."""
@@ -1485,7 +1525,17 @@ class Engine:
         self.m.command('loadfile', url, mode, -1, ','.join(opts))
 
     def load_stream(self, stream, mode, cover=None, start=None):
-        self.load(stream['url'], mode, stream['title'], stream.get('audio'), stream.get('ua'), cover, start)
+        cap = pick_caption(stream)
+        opts = [f'sub-file={mpv_quote(cap["url"])}', 'sid=auto'] if cap else None
+        self.load(stream['url'], mode, stream['title'], stream.get('audio'), stream.get('ua'), cover, start, opts)
+
+    def add_caption(self, cap):
+        """A caption track now (the gear menu): selected, or the one already loaded."""
+        for t in self.m.track_list or []:
+            if t.get('type') == 'sub' and t.get('external-filename') == cap['url']:
+                self.m.sid = t['id']
+                return
+        self.m.command('sub-add', cap['url'], 'select', cap['name'], cap['lang'])
 
     def swap_video(self, quick_url, stream):
         """Upgrade a quick-started 360p stream to the full one without restarting."""
@@ -1495,6 +1545,9 @@ class Engine:
             self.m.command('video-add', stream['url'], 'select', f'{stream.get("height") or "HD"}p')
             if quick_url and stream.get('audio'):
                 self.m.command('audio-add', stream['audio'], 'select', 'HD')
+            cap = pick_caption(stream)
+            if cap:
+                self.add_caption(cap)
         except Exception:  # noqa: BLE001 - fall back to reloading at the same position
             self.load_stream(stream, 'replace', start=self.m.time_pos or 0)
 
@@ -1729,6 +1782,9 @@ class ExternalPlayer:
             opts['user-agent'] = stream['ua']
         if start:
             opts['start'] = f'{start:.1f}'
+        cap = pick_caption(stream)
+        if cap:
+            opts['sub-file'] = cap['url']
         self.command({'name': 'loadfile', 'url': stream['url'], 'flags': flags, 'options': opts})
 
 # ---------------------------------------------------------------- downloads
@@ -2611,7 +2667,7 @@ class WatchPage(Adw.NavigationPage):
         self.controls.later.handler_unblock(self.controls.later_handler)
         self.controls.later.set_tooltip_text('Favourite channel' if live else 'Watch later')
         self.controls.later.set_icon_name('starred-symbolic' if live else 'alarm-symbolic')
-        self.controls.gear.set_tooltip_text('Quality, audio & subtitles' if live else 'Quality & speed')
+        self.controls.gear.set_tooltip_text('Quality, audio & subtitles' if live else 'Quality, captions & speed')
         self.controls.dl.set_visible(not live)
         self.controls.progress.set_visible(not live)
         self.buffer_label.set_label('Tuning in…')
@@ -2811,7 +2867,35 @@ class WatchPage(Adw.NavigationPage):
             self._menu_item(box, f'{h}p', lambda h=h: self.win.change_quality(h),
                             current=not audio_mode and current == h, popover=pop)
         self._menu_item(box, 'Audio only', lambda: self.win.change_quality(None), current=audio_mode, popover=pop)
+        caps = (self.stream or {}).get('captions') or []
+        if caps:
+            box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+            heading = Gtk.Label(label='Captions', xalign=0, margin_start=8)
+            heading.add_css_class('heading')
+            box.append(heading)
+            try:
+                showing = next((t for t in self.engine.m.track_list or []
+                                if t.get('type') == 'sub' and t.get('selected')), None)
+            except Exception:  # noqa: BLE001
+                showing = None
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            self._menu_item(inner, 'Off', lambda: self.set_caption(None), current=showing is None, popover=pop)
+            for c in caps:
+                self._menu_item(inner, c['name'], lambda c=c: self.set_caption(c),
+                                current=bool(showing and showing.get('external-filename') == c['url']), popover=pop)
+            box.append(Gtk.ScrolledWindow(child=inner, propagate_natural_height=True, max_content_height=220,
+                                          hscrollbar_policy=Gtk.PolicyType.NEVER))
         return box
+
+    def set_caption(self, cap):
+        """YouTube captions on (that track) or off; remembered for the next videos."""
+        global CAPTION_PREF
+        CAPTION_PREF = self.win.config['yt_captions'] = cap['lang'] if cap else ''
+        self.win.save_config()
+        if cap:
+            self.engine.add_caption(cap)
+        else:
+            self.engine.m.sid = 'no'
 
     def _tracks_menu(self, pop):
         """Live channels: qualities, sources, and subtitle and audio tracks."""
@@ -4053,6 +4137,8 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         self.set_size_request(400, 360)
         self.app = app
         self.config = self._load_config()
+        global CAPTION_PREF
+        CAPTION_PREF = self.config['yt_captions']
         self.lib = Library(DB_FILE)
         self.yt = Lookups()
         self.yt.set_browser(self.config['browser'])
@@ -4196,7 +4282,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         cfg = {'quality': 720, 'audio_only': False, 'inapp': True, 'fullscreen': False, 'hover_preview': True,
                'preload_previews': False, 'browser': None, 'download_dir': DEFAULT_DOWNLOAD_DIR, 'volume': 100,
                'iptv': [], 'iptv_source': IPTV_DEFAULT, 'iptv_all': False, 'list_order': {},
-               'theme': 'system'}
+               'theme': 'system', 'yt_captions': ''}
         try:
             with open(CONFIG_FILE) as f:
                 cfg.update(json.load(f))
