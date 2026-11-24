@@ -2841,6 +2841,33 @@ class StatsPanel(Gtk.Box):
         self.bars['buffer'].set_value(min(1.0, buffered / 60))
 
 
+class WidthFirst(Gtk.Widget):
+    """Holds a widget and reports its width without regard to the height offered. Beside Up next,
+    GTK asked the player column how wide it must be for the page's height, and its wrapped text
+    (comments) then claimed ever more width and pushed Up next off-screen. (A Gtk.Box subclass
+    can't do this: boxes measure through their layout manager, never the class's measure.)"""
+
+    def __init__(self, child, **kw):
+        super().__init__(**kw)
+        self.child = child
+        child.set_parent(self)
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        return self.child.measure(orientation, -1 if orientation == Gtk.Orientation.HORIZONTAL else for_size)
+
+    def do_size_allocate(self, width, height, baseline):
+        self.child.allocate(width, height, baseline, None)
+
+    def do_dispose(self):
+        if self.child is not None:
+            self.child.unparent()
+            self.child = None
+        Gtk.Widget.do_dispose(self)
+
+
 class WatchPage(Adw.NavigationPage):
     """The in-app player plus the video's details, like a YouTube watch page."""
 
@@ -2893,7 +2920,7 @@ class WatchPage(Adw.NavigationPage):
 
         self.info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=14, margin_bottom=24,
                             margin_start=6, margin_end=6)
-        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.body.append(self.player)
         self.body.append(self.info)
         # Up next (YouTube) or more channels (live TV): a column beside the player on wide windows,
@@ -2911,7 +2938,7 @@ class WatchPage(Adw.NavigationPage):
             self.side.append(w)
         self._side_on = False
         self.columns = Gtk.Box(spacing=18)
-        self.columns.append(self.body)
+        self.columns.append(WidthFirst(self.body, hexpand=True))
         self.columns.append(self.side)
         self.clamp = Adw.Clamp(maximum_size=WATCH_W, child=self.columns, margin_start=12, margin_end=12,
                                margin_top=8)
@@ -3378,6 +3405,8 @@ class WatchPage(Adw.NavigationPage):
 
     # ---- details under the player ------------------------------------------------
     def _build_info(self, video):
+        # Wrapping labels here get max_width_chars=1: their natural width would otherwise be their
+        # whole text on one line, and a long comment made the details column push Up next off-screen.
         win, lib, gen = self.win, self.win.lib, self._gen
         while (child := self.info.get_first_child()):
             self.info.remove(child)
@@ -3385,7 +3414,7 @@ class WatchPage(Adw.NavigationPage):
         self.side_spinner.set_visible(False)
         self.show_side(False)
         if video.kind == 'file':  # a downloaded file: nothing to look up online
-            title = Gtk.Label(label=video.title, xalign=0, wrap=True)
+            title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
             title.add_css_class('title-3')
             self.info.append(title)
             return
@@ -3393,7 +3422,7 @@ class WatchPage(Adw.NavigationPage):
             self._build_live_info(video)
             return
 
-        title = Gtk.Label(label=video.title, xalign=0, wrap=True)
+        title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
         title.add_css_class('title-3')
         self.info.append(title)
         self.title_label = title
@@ -3407,7 +3436,7 @@ class WatchPage(Adw.NavigationPage):
         self.sub_btn = SubscribeButton(win, lambda: (self.video.channel_id, self.video.channel,
                                                      self.video.channel_link))
         row.append(self.sub_btn)
-        self.meta_label = Gtk.Label(label=video.meta(), xalign=1, hexpand=True, wrap=True)
+        self.meta_label = Gtk.Label(label=video.meta(), xalign=1, hexpand=True, wrap=True, max_width_chars=1)
         self.meta_label.add_css_class('dim-label')
         row.append(self.meta_label)
         self.info.append(row)
@@ -3431,7 +3460,7 @@ class WatchPage(Adw.NavigationPage):
         actions.append(Gtk.MenuButton(icon_name='view-more-symbolic', menu_model=more, tooltip_text='More'))
         self.info.append(actions)
 
-        self.desc = Gtk.Label(xalign=0, wrap=True, selectable=True, focusable=False, use_markup=True,
+        self.desc = Gtk.Label(xalign=0, wrap=True, max_width_chars=1, selectable=True, focusable=False, use_markup=True,
                               wrap_mode=Pango.WrapMode.WORD_CHAR)
         self.desc_expander = Gtk.Expander(label='Description', child=self.desc, visible=False)
         self.info.append(self.desc_expander)
@@ -3535,8 +3564,8 @@ class WatchPage(Adw.NavigationPage):
                         + f'  <span alpha="60%">{GLib.markup_escape_text(c["time"])}'
                         + (f' · 👍 {fmt_count(c["likes"])}' if c['likes'] else '')
                         + (' · 📌 pinned' if c['pinned'] else '') + '</span>')
-                item.append(Gtk.Label(label=head, use_markup=True, xalign=0, wrap=True))
-                item.append(Gtk.Label(label=c['text'], xalign=0, wrap=True, selectable=True, focusable=False,
+                item.append(Gtk.Label(label=head, use_markup=True, xalign=0, wrap=True, max_width_chars=1))
+                item.append(Gtk.Label(label=c['text'], xalign=0, wrap=True, max_width_chars=1, selectable=True, focusable=False,
                                       wrap_mode=Pango.WrapMode.WORD_CHAR))
                 self.comments.append(item)
 
@@ -3610,13 +3639,13 @@ class WatchPage(Adw.NavigationPage):
     def _build_live_info(self, video):
         win, nl, gen = self.win, self.win.now_live, self._gen
         self.show_meta = self._start_details = None
-        title = Gtk.Label(label=video.title, xalign=0, wrap=True)
+        title = Gtk.Label(label=video.title, xalign=0, wrap=True, max_width_chars=1)
         title.add_css_class('title-3')
         self.title_label = title
         src = (win.live_index.get(video.id) or {}).get('source')
         source = next((pl['name'] for pl in win.config['iptv'] if pl['url'] == src), 'IPTV')
         self.meta_label = Gtk.Label(label=' · '.join(b for b in (source, video.channel, video.views_text) if b),
-                                    xalign=0, wrap=True)
+                                    xalign=0, wrap=True, max_width_chars=1)
         self.meta_label.add_css_class('dim-label')
         actions = Gtk.Box(spacing=6)
         self.fav_btn = Gtk.ToggleButton(child=Adw.ButtonContent(label='Favourite', icon_name='starred-symbolic'),
