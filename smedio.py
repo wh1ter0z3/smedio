@@ -63,7 +63,7 @@ YTDLP = os.path.join(VENV_BIN, 'yt-dlp') if HAVE_VENV else (shutil.which('yt-dlp
 import gi  # noqa: E402
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), 'smedio')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
@@ -123,8 +123,13 @@ LIST_FIRST = 72   # cards shown at first on long lists; more as you scroll
 QUEUE_MAX = 200   # videos lined up after the one you click in a list
 THUMB_W, THUMB_H = 240, 135
 GRID_COLUMNS = ((None, 499, 1), (500, 749, 2), (750, 1099, 3))  # page width (px) -> cards a row; wider: 4
-ROW_W, ROW_H = 168, 94  # Up next beside the player: a small thumbnail with the text to its right
-WATCH_W, SIDE_W = 1100, 380  # the player column's width at most; Up next's column next to it
+# The watch page fits itself to the screen (see WatchColumns): Up next's thumbnails are as tall as
+# lets about UPNEXT_ROWS rows show, its column is as wide as they need (at most UPNEXT_SHARE of the
+# page), and the player takes the rest, at most PLAYER_VH of the visible height.
+ROW_W, ROW_H = 288, 162   # Up next thumbnail: its 16:9 shape and natural size; it scales
+UPNEXT_ROWS, UPNEXT_SHARE, PLAYER_VH = 5.5, 0.36, 0.8
+WATCH_GAP = 28            # between the player column and Up next
+SIDE_BELOW = 999          # page width (px) up to which Up next goes under the video instead
 SHORT_W, SHORT_H = 162, 288
 RESOLVE_TTL = 20 * 60   # stream URLs stay valid for hours; keep lookups for 20 min
 PREVIEW_TTL = 60 * 60
@@ -2130,7 +2135,7 @@ class Card(Gtk.FlowBoxChild):
         self.set_tooltip_text(video.title)
 
         self.thumb = Thumb(*((LIVE_W, LIVE_H) if live else (SHORT_W, SHORT_H) if vertical else
-                             (ROW_W, ROW_H) if row else (THUMB_W, THUMB_H)), fluid=self.fluid)
+                             (ROW_W, ROW_H) if row else (THUMB_W, THUMB_H)), fluid=self.fluid or row)
         if video.kind in ('channel', 'live'):
             self.thumb.set_content_fit(Gtk.ContentFit.CONTAIN)
         if live:
@@ -2170,9 +2175,9 @@ class Card(Gtk.FlowBoxChild):
             text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.START)
             text.append(title)
             text.append(meta)
-            box = Gtk.Box(spacing=10)
-            box.append(overlay)
-            box.append(text)
+            box = Gtk.Grid(column_homogeneous=True, column_spacing=10)  # thumbnail 7/12, text 5/12
+            box.attach(overlay, 0, 0, 7, 1)
+            box.attach(text, 7, 0, 5, 1)
             self.add_css_class('tl-row')
         else:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -2841,30 +2846,86 @@ class StatsPanel(Gtk.Box):
         self.bars['buffer'].set_value(min(1.0, buffered / 60))
 
 
-class WidthFirst(Gtk.Widget):
-    """Holds a widget and reports its width without regard to the height offered. Beside Up next,
-    GTK asked the player column how wide it must be for the page's height, and its wrapped text
-    (comments) then claimed ever more width and pushed Up next off-screen. (A Gtk.Box subclass
-    can't do this: boxes measure through their layout manager, never the class's measure.)"""
+class WatchColumns(Gtk.Widget):
+    """The player column and Up next beside it, fitted to the screen: Up next's thumbnails are as
+    tall as lets about UPNEXT_ROWS rows show in the visible height, its column as wide as they
+    need (at most UPNEXT_SHARE of the page), and the player takes the rest, at most PLAYER_VH of
+    the visible height; the pair is centred. `below` (a breakpoint, on narrow pages) puts Up next
+    under the details; fullscreen gives the player everything. Widths never depend on the height
+    offered (GTK asked that, and long comments then pushed Up next off-screen)."""
+    below = GObject.Property(type=bool, default=False)
 
-    def __init__(self, child, **kw):
-        super().__init__(**kw)
-        self.child = child
-        child.set_parent(self)
+    def __init__(self, page, body, side):
+        super().__init__()
+        self.page, self.body, self.side = page, body, side
+        body.set_parent(self)
+        side.set_parent(self)
+        self._vh = 0
+        self.connect('notify::below', lambda *_: self.queue_resize())
+
+    def viewport_changed(self, height):
+        if abs(height - self._vh) > 4:
+            self._vh = height
+            GLib.idle_add(lambda: self.queue_resize() and False)
+
+    def _sizes(self, width):
+        """(player column width, Up next width, left offset); Up next width 0 when hidden."""
+        vh = self._vh or 800
+        if self.page.is_fullscreen:
+            return width, 0, 0
+        player_max = round(vh * PLAYER_VH * 16 / 9)
+        if not self.side.get_visible() or self.below:
+            body = min(width, player_max)
+            return body, (body if self.side.get_visible() else 0), (width - body) // 2
+        thumb_h = vh / UPNEXT_ROWS - 22                       # row padding and spacing
+        side = round(thumb_h * 16 / 9 * 12 / 7 + 18)          # the thumbnail is 7/12 of a row
+        side = max(300, min(side, round(width * UPNEXT_SHARE)))
+        body = max(1, min(width - WATCH_GAP - side, player_max))
+        return body, side, max(0, (width - body - WATCH_GAP - side) // 2)
 
     def do_get_request_mode(self):
         return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
 
     def do_measure(self, orientation, for_size):
-        return self.child.measure(orientation, -1 if orientation == Gtk.Orientation.HORIZONTAL else for_size)
+        side_on = self.side.get_visible()
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            bmin, bnat = self.body.measure(orientation, -1)[:2]
+            if not side_on:
+                return bmin, bnat, -1, -1
+            smin = self.side.measure(orientation, -1)[0]
+            if self.below:
+                return max(bmin, smin), max(bnat, smin), -1, -1
+            return bmin + WATCH_GAP + max(smin, 300), bnat + WATCH_GAP + 500, -1, -1
+        body, side, _ = self._sizes(for_size if for_size > 0 else 1100)
+        bmin, bnat = self.body.measure(orientation, body)[:2]
+        if not side_on:
+            return bmin, bnat, -1, -1
+        smin, snat = self.side.measure(orientation, side)[:2]
+        if self.below:
+            return bmin + WATCH_GAP + smin, bnat + WATCH_GAP + snat, -1, -1
+        return max(bmin, smin), max(bnat, snat), -1, -1
+
+    @staticmethod
+    def _place(child, x, y, w, h):
+        child.allocate(w, h, -1, Gsk.Transform.new().translate(Graphene.Point().init(x, y)))
 
     def do_size_allocate(self, width, height, baseline):
-        self.child.allocate(width, height, baseline, None)
+        body, side, x = self._sizes(width)
+        if not self.side.get_visible():
+            self._place(self.body, x, 0, body, height)
+        elif self.below:
+            bh = max(self.body.measure(Gtk.Orientation.VERTICAL, body)[1], 1)
+            self._place(self.body, x, 0, body, bh)
+            self._place(self.side, x, bh + WATCH_GAP, side, max(1, height - bh - WATCH_GAP))
+        else:
+            self._place(self.body, x, 0, body, height)
+            self._place(self.side, x + body + WATCH_GAP, 0, side, height)
 
     def do_dispose(self):
-        if self.child is not None:
-            self.child.unparent()
-            self.child = None
+        for child in (self.body, self.side):
+            if child is not None and child.get_parent() is self:
+                child.unparent()
+        self.body = self.side = None
         Gtk.Widget.do_dispose(self)
 
 
@@ -2930,26 +2991,25 @@ class WatchPage(Adw.NavigationPage):
         self.side_spinner = Adw.Spinner(width_request=32, height_request=32, visible=False)
         self.related = Gtk.FlowBox(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
                                    activate_on_single_click=True, min_children_per_line=1, max_children_per_line=1,
-                                   column_spacing=6, row_spacing=2, valign=Gtk.Align.START)
+                                   column_spacing=12, row_spacing=12, valign=Gtk.Align.START)
         self.related.connect('child-activated', lambda _f, card: win.activate_card(card))
-        self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=SIDE_W,
-                            hexpand=False, valign=Gtk.Align.START, margin_bottom=24, visible=False)
+        self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.START,
+                            margin_bottom=24, visible=False)
         for w in (self.side_title, self.side_spinner, self.related):
             self.side.append(w)
         self._side_on = False
-        self.columns = Gtk.Box(spacing=18)
-        self.columns.append(WidthFirst(self.body, hexpand=True))
-        self.columns.append(self.side)
-        self.clamp = Adw.Clamp(maximum_size=WATCH_W, child=self.columns, margin_start=12, margin_end=12,
-                               margin_top=8)
+        self.columns = WatchColumns(self, self.body, self.side)
+        self.clamp = Adw.Clamp(maximum_size=100000, child=self.columns, margin_start=12, margin_end=12,
+                               margin_top=8)  # WatchColumns sizes and centres everything
         self.scroller = Gtk.ScrolledWindow(child=self.clamp, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.scroller.get_vadjustment().connect(
+            'notify::page-size', lambda adj, _p: self.columns.viewport_changed(adj.get_page_size()))
         self._start_details = None
         self.scroller.get_vadjustment().connect(
             'value-changed', lambda adj: adj.get_value() > 40 and self._start_details and self._start_details())
         bin_ = Adw.BreakpointBin(child=self.scroller, width_request=300, height_request=200)
-        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(f'max-width: {WATCH_W - 100}px'))
-        narrow.add_setter(self.columns, 'orientation', Gtk.Orientation.VERTICAL)
-        narrow.add_setter(self.side, 'width-request', -1)
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(f'max-width: {SIDE_BELOW}px'))
+        narrow.add_setter(self.columns, 'below', True)
         narrow.add_setter(self.related, 'max-children-per-line', 2)
         bin_.add_breakpoint(narrow)
         self.set_child(bin_)
@@ -3139,12 +3199,10 @@ class WatchPage(Adw.NavigationPage):
         self.poke()
 
     def show_side(self, on):
-        """Up next beside the player (it widens the page so the player keeps its size)."""
+        """Up next beside the player (or below it on narrow pages); WatchColumns does the sizes."""
         self._side_on = on
         self.side.set_visible(on and not self.is_fullscreen)
-        width = 100000 if self.is_fullscreen else WATCH_W + 18 + SIDE_W if on else WATCH_W
-        self.clamp.set_maximum_size(width)
-        self.clamp.set_tightening_threshold(width)  # full width up to that, no gradual narrowing
+        self.columns.queue_resize()
 
     def _on_motion(self, _ctl, x, y):
         # GTK sends a synthetic motion event when the bar hides; only real movement should wake it.
@@ -4470,7 +4528,6 @@ CSS = f"""
 flowboxchild.tl-card {{ padding: 6px; border-radius: 14px; }}
 flowboxchild.tl-card:hover {{ background-color: alpha(currentColor, 0.06); }}
 flowboxchild.tl-row {{ padding: 4px; border-radius: 10px; }}
-flowboxchild.tl-row .tl-title {{ font-size: 0.95em; }}
 
 /* 2012-style player */
 .tl-player {{ background-color: black; border-radius: 0; }}
