@@ -100,6 +100,20 @@ settings stay):
 ./install.sh --uninstall
 ```
 
+### postmarketOS package
+
+[packaging/postmarketos/APKBUILD](packaging/postmarketos/APKBUILD) builds the
+latest tagged release as an Alpine package (it installs to `/usr/share/smedio`,
+for every user). On the device, with `abuild` set up:
+
+```sh
+cd packaging/postmarketos
+abuild -r
+```
+
+Or with pmbootstrap, copy the folder into your pmaports checkout (for example
+as `temp/smedio`) and run `pmbootstrap build smedio`.
+
 ## Keyboard
 
 | Key | Action |
