@@ -1436,6 +1436,54 @@ def recommend(lib, yt, pool, limit=60):
     return out
 
 
+def recommend_more(lib, yt, pool, shown, state, want=30):
+    """The next part of 'For you' as you scroll down: related videos of older favourites and of
+    what the feed already shows, and further search results for your topics. `state` (a dict,
+    emptied when the feed reloads) remembers the seeds used so every part is new."""
+    watched = lib.history_ids()
+    hidden_v, hidden_c = lib.hidden()
+    likes, hist = lib.items('liked', 200), lib.history(300)
+    used = state.setdefault('seeds', set())
+    rnd = state['round'] = state.get('round', 0) + 1
+    shown_ids = {v.id for v in shown}
+    own = [v for v in likes[3:] + hist[5:] if v.id not in used]          # older favourites
+    feed = [v for v in shown if v.id not in used and v.kind == 'video']  # what the feed found
+    seeds = own[:3] + random.sample(feed, min(3, len(feed)))
+    used.update(v.id for v in seeds)
+    kws = title_keywords([(v, 3) for v in likes] + [(v, 1) for v in hist], 8)
+    query = kws[rnd % len(kws)] if kws else None
+    futures = {pool.submit(yt.related, v.id): 'related' for v in seeds}
+    if query:
+        futures[pool.submit(yt.search, query, 12 + 12 * rnd)] = 'search'
+
+    picked = {}
+    try:
+        for fut in as_completed(futures, timeout=45):
+            try:
+                res = fut.result()
+            except Exception:  # noqa: BLE001 - one failed source shouldn't end the feed
+                continue
+            if futures[fut] == 'search':
+                res = res[12 * rnd:] or res  # the part the earlier rounds didn't reach
+            for rank, v in enumerate(res[:20]):
+                if (v.kind != 'video' or v.short or v.id in watched or v.id in shown_ids or v.id in hidden_v
+                        or (v.channel_id and v.channel_id in hidden_c) or v.channel in hidden_c):
+                    continue
+                score = max(0.25, 1 - rank / 20) * random.uniform(0.85, 1.15)
+                picked[v.id] = (v, picked[v.id][1] + score if v.id in picked else score)
+    except FutureTimeout:
+        pass
+    per_channel, out = Counter(), []
+    for v, _ in sorted(picked.values(), key=lambda it: -it[1]):
+        key = v.channel_id or v.channel
+        if per_channel[key] < 3:
+            per_channel[key] += 1
+            out.append(v)
+            if len(out) >= want:
+                break
+    return out
+
+
 def shorts_feed(lib, yt, pool, google_channels=None, limit=48):
     """Shorts from channels you follow or watch, plus shorts about your topics."""
     watched = lib.history_ids()
@@ -4621,11 +4669,15 @@ class Window(LiveMixin, Adw.ApplicationWindow):
                                   'g:history': ('history', 'History', 60)}[key]
             return GridPage(self, title, lambda: yt.feed(name, limit), cache_key=key)
         if key == 'l:foryou':
-            return GridPage(self, 'For you', lambda: recommend(lib, yt, self.feed_pool), cache_key='l:foryou',
-                            empty=('Nothing to recommend yet',
-                                   'Watch, like or subscribe to a few things and Smedio will learn what you like — '
-                                   'all on this device. Or bring your subscriptions and likes from Google.',
-                                   self._onboarding_buttons))
+            ref, state = {}, {}  # more as you scroll: recommend_more() continues the feed
+            ref['page'] = GridPage(
+                self, 'For you', lambda: (state.clear(), recommend(lib, yt, self.feed_pool))[1], cache_key='l:foryou',
+                more=lambda _n: recommend_more(lib, yt, self.feed_pool, [c.video for c in ref['page'].cards], state),
+                empty=('Nothing to recommend yet',
+                       'Watch, like or subscribe to a few things and Smedio will learn what you like — '
+                       'all on this device. Or bring your subscriptions and likes from Google.',
+                       self._onboarding_buttons))
+            return ref['page']
         if key == 'shorts':
             return GridPage(self, 'Shorts', self._shorts_fetch, vertical=True, cache_key='shorts',
                             empty=('No Shorts found', 'Subscribe to channels or watch a few videos first.', None))
