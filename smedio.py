@@ -541,11 +541,13 @@ class Video:
             return [base + 'hq720.jpg', base + 'hqdefault.jpg']
         if vertical:
             return [base + 'oardefault.jpg', base + 'hqdefault.jpg']
-        return [base + 'mqdefault.jpg', base + 'hqdefault.jpg']
+        # 480x360 (4:3 with bars; the 16:9 cards crop them off): sharp on cards up to ~480 px wide
+        return [base + 'hqdefault.jpg', base + 'mqdefault.jpg']
 
     def thumb_path(self, vertical=False, large=False):
         key = self.id if self.kind == 'video' else hashlib.md5((self.thumb or self.id).encode()).hexdigest()
-        return os.path.join(THUMB_DIR, f'{key}{"_v" if vertical else ""}{"_l" if large else ""}.jpg')
+        size = '_v' if vertical else '_l' if large else '_hq' if self.kind == 'video' else ''
+        return os.path.join(THUMB_DIR, f'{key}{size}.jpg')
 
     def meta(self):
         if self.kind == 'channel':
