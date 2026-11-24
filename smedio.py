@@ -4739,7 +4739,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         groups = []
         if self.config['browser']:
             groups.append((f'YouTube · {BROWSERS[self.config["browser"]][0]}', GOOGLE_SECTIONS))
-        groups.append(('YouTube · this device', LOCAL_SECTIONS))
+        groups.append(('YouTube · local', LOCAL_SECTIONS))
         groups.append(('Live TV', self.live_sections()))
         for title, sections in groups:
             label = Gtk.Label(label=title, xalign=0, ellipsize=Pango.EllipsizeMode.END)
