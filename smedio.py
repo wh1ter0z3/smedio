@@ -129,6 +129,8 @@ SHORT_W, SHORT_H = 162, 288
 RESOLVE_TTL = 20 * 60   # stream URLs stay valid for hours; keep lookups for 20 min
 PREVIEW_TTL = 60 * 60
 YT_RED = '#cc181e'      # the 2012-era player red
+# The app mark (same as dev.smedio.Smedio.svg): a white S on a red tile, with a play arrow.
+LOGO_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"> <defs> <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1"> <stop offset="0" stop-color="#ff5a3c"/> <stop offset="1" stop-color="#c4161c"/> </linearGradient> </defs> <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#tile)"/> <path d="M86 40 C80 30 63 28 53 33 C41 39 43 54 57 58 L71 62 C85 66 87 83 72 91 C64 95 54 94 47 89" fill="none" stroke="#fff" stroke-width="13" stroke-linecap="round"/> <path d="M24 76 L44 88 L24 100 Z" fill="#fff" stroke="#fff" stroke-width="6" stroke-linejoin="round"/> </svg>')
 
 BROWSERS = {  # yt-dlp name -> (label, profile folders that show it is installed)
     'firefox': ('Firefox', ['~/.mozilla/firefox', '~/snap/firefox/common/.mozilla/firefox',
@@ -1111,7 +1113,10 @@ class YouTube:
                          'description': info.get('description') or '', 'comment_count': info.get('comment_count'),
                          'channel': info.get('channel') or info.get('uploader'), 'channel_id': info.get('channel_id'),
                          'channel_url': info.get('channel_url'), 'duration': info.get('duration')},
-                'preview': preview['url'] if preview else None, 'captions': yt_captions(info)}
+                'preview': preview['url'] if preview else None, 'captions': yt_captions(info),
+                'chapters': [{'start': c.get('start_time') or 0,  # yt-dlp's '<Untitled Chapter 1>' -> no name
+                              'title': '' if (c.get('title') or '').startswith('<Untitled') else c.get('title') or ''}
+                             for c in info.get('chapters') or []]}
 
     def moving_thumbs(self, query):
         """YouTube's animated 3-second thumbnails for a search ({video id: webp url}); ~50 KB."""
@@ -2047,7 +2052,47 @@ class Downloads:
             d.status, d.detail = 'Failed', error or 'yt-dlp could not download this video'
         idle(self._changed, d)
 
+# ---------------------------------------------------------------- SponsorBlock
+SPONSORBLOCK = 'https://sponsor.ajay.app/api/skipSegments/'
+SB_CATEGORIES = {'sponsor': 'sponsor', 'selfpromo': 'self-promotion', 'interaction': 'subscribe reminder'}
+
+
+def sponsor_segments(video_id):
+    """Parts of a YouTube video that SponsorBlock users marked as sponsor, self-promotion or
+    subscribe reminder: [(start, end, category)]. Asked by the first 4 characters of the ID's
+    SHA-256 (with hundreds of other videos), so the server can't tell which video plays."""
+    prefix = hashlib.sha256(video_id.encode()).hexdigest()[:4]
+    query = urllib.parse.urlencode({'categories': json.dumps(list(SB_CATEGORIES)),
+                                    'actionTypes': json.dumps(['skip'])})
+    try:
+        data = json.loads(http_get(f'{SPONSORBLOCK}{prefix}?{query}', timeout=10))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # nothing marked for any video with this prefix
+            return []
+        raise
+    for item in data:
+        if item.get('videoID') == video_id:
+            return sorted((float(seg['segment'][0]), float(seg['segment'][1]), seg.get('category'))
+                          for seg in item.get('segments') or []
+                          if len(seg.get('segment') or []) == 2 and seg.get('category') in SB_CATEGORIES)
+    return []
+
 # ---------------------------------------------------------------- widgets
+
+
+def logo_image(size):
+    """The app mark at `size` px (drawn at twice that, so it stays sharp on HiDPI screens)."""
+    img = Gtk.Image(pixel_size=size)
+    try:
+        gi.require_version('GdkPixbuf', '2.0')
+        from gi.repository import GdkPixbuf
+        stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(LOGO_SVG.encode()))
+        pb = GdkPixbuf.Pixbuf.new_from_stream_at_scale(stream, size * 2, size * 2, True, None)
+        ok, png = pb.save_to_bufferv('png', [], [])
+        img.set_from_paintable(Gdk.Texture.new_from_bytes(GLib.Bytes.new(png)))
+    except (GLib.Error, ValueError):
+        img.set_from_icon_name(APP_ID)  # no SVG loader: the installed icon
+    return img
 
 
 class Thumb(Gtk.Picture):
@@ -2512,7 +2557,12 @@ class ControlBar(Gtk.Box):
         hover = Gtk.EventControllerMotion()
         hover.connect('motion', self._progress_hover)
         self.progress.add_controller(hover)
-        self.append(self.progress)
+        self._chapters = []
+        self.chapter_gaps = Gtk.DrawingArea(can_target=False)  # YouTube-style gaps where chapters begin
+        self.chapter_gaps.set_draw_func(self._draw_chapter_gaps)
+        bar = Gtk.Overlay(child=self.progress)
+        bar.add_overlay(self.chapter_gaps)
+        self.append(bar)
 
         row = Gtk.Box(spacing=2)
         row.add_css_class('tl-controls')
@@ -2541,18 +2591,45 @@ class ControlBar(Gtk.Box):
         self.dl.get_popover().connect('show', lambda p: p.set_child(page.download_menu()))
         for b in (self.gear, self.dl):
             b.add_css_class('tl-pbtn')
-        brand = Gtk.Label(use_markup=True, valign=Gtk.Align.CENTER,
-                          label=f'S<span background="{YT_RED}" foreground="white"> medio </span>')
+        brand = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        brand.append(logo_image(18))
+        brand.append(Gtk.Label(label='Smedio'))
         brand.add_css_class('tl-brand')
         self.fs_btn = player_button('view-fullscreen-symbolic', 'Fullscreen (f)', page.toggle_fullscreen)
         for w in (self.gear, self.later, self.dl, brand, self.fs_btn):
             row.append(w)
         self.append(row)
 
+    def set_chapters(self, chapters):
+        """YouTube chapters: a gap in the bar where each begins, the name in the time label."""
+        self._chapters = chapters
+        self.chapter_gaps.queue_draw()
+
+    def _draw_chapter_gaps(self, _area, cr, w, h):
+        if not self._dur or len(self._chapters) < 2:
+            return
+        cr.set_source_rgba(0, 0, 0, 0.85)
+        knob = 2 + self.progress.get_value() / self._dur * (w - 4)
+        for c in self._chapters[1:]:
+            x = 2 + c['start'] / self._dur * (w - 4)  # the bar's trough is inset 2 px each side
+            if abs(x - knob) > 8:  # not across the knob
+                cr.rectangle(round(x) - 1, h / 2 - 5, 2, 10)
+        cr.fill()
+
+    def chapter_at(self, t):
+        title = None
+        for c in self._chapters:
+            if c['start'] > t:
+                break
+            title = c['title']
+        return title
+
     def _progress_hover(self, _ctl, x, _y):
         w = self.progress.get_width()
         if self._dur and w:
-            self.progress.set_tooltip_text(fmt_duration(max(0.0, min(1.0, x / w)) * self._dur) or '0:00')
+            t = max(0.0, min(1.0, x / w)) * self._dur
+            chapter = self.chapter_at(t)
+            self.progress.set_tooltip_text((fmt_duration(t) or '0:00') + (f' · {chapter}' if chapter else ''))
 
     def update(self, name, value, engine):
         if name == 'time-pos' and value is not None and self.page.video is not None and self.page.video.kind == 'live':
@@ -2560,11 +2637,15 @@ class ControlBar(Gtk.Box):
         elif name == 'time-pos' and value is not None:
             if self._dur:
                 self.progress.set_value(value)
-            self.time.set_label(f'{fmt_duration(value) or "0:00"} / {fmt_duration(self._dur) or "0:00"}'
-                                if self._dur else fmt_duration(value) or '0:00')
+            chapter = self.chapter_at(value)
+            if len(self._chapters) > 1:
+                self.chapter_gaps.queue_draw()  # keep the gaps off the knob
+            self.time.set_label((f'{fmt_duration(value) or "0:00"} / {fmt_duration(self._dur) or "0:00"}'
+                                 if self._dur else fmt_duration(value) or '0:00') + (f'  ·  {chapter}' if chapter else ''))
         elif name == 'duration':
             self._dur = value or 0.0
             self.progress.set_range(0, max(self._dur, 1))
+            self.chapter_gaps.queue_draw()
         elif name == 'demuxer-cache-time' and value is not None:
             self.progress.set_fill_level(value)
         elif name == 'pause':
@@ -2854,7 +2935,8 @@ class WatchPage(Adw.NavigationPage):
                          ('copy', lambda: win.copy_link(self.video)),
                          ('copy-time', self.copy_link_at_time),
                          ('stats', lambda: self.stats.toggle()),
-                         ('loop', self.toggle_loop)):
+                         ('loop', self.toggle_loop),
+                         ('screenshot', self.screenshot)):
             a = Gio.SimpleAction.new(name, None)
             a.connect('activate', lambda *_a, cb=cb: cb())
             group.add_action(a)
@@ -2865,6 +2947,8 @@ class WatchPage(Adw.NavigationPage):
         self.controls.update(name, value, self.engine)
         st = self._state
         st[name] = value
+        if name == 'time-pos' and value is not None and self.segments:
+            self._skip_sponsor(value)
         # Channels: 'wait' (finding the stream) -> 'ready' (handed to mpv) -> 'opening'
         # (mpv is loading it) -> False once it plays. Back to idle while opening = it failed.
         if name == 'idle-active' and self.loading == 'ready' and value is False:
@@ -2891,6 +2975,8 @@ class WatchPage(Adw.NavigationPage):
         """Fill the details below the player (the engine is driven by the window)."""
         self.video, self.stream = video, stream
         self._gen += 1
+        self.segments, self._skipped, self._sb_for = [], set(), None
+        self.controls.set_chapters([])
         self.set_title(video.title)
         self.fs_title.set_label(video.title)
         live = video.kind == 'live'
@@ -2920,6 +3006,47 @@ class WatchPage(Adw.NavigationPage):
             self.stream = stream
             if stream.get('meta') and getattr(self, 'show_meta', None):
                 self.show_meta(stream['meta'])
+            self.controls.set_chapters(stream.get('chapters') or [])
+            if self.win.config['sponsorblock'] and video.kind == 'video' and not video.live \
+                    and self._sb_for != video.id:
+                self._sb_for, gen = video.id, self._gen
+
+                def work():
+                    try:
+                        segs = sponsor_segments(video.id)
+                    except Exception:  # noqa: BLE001 - SponsorBlock is optional
+                        return
+                    idle(lambda: gen == self._gen and setattr(self, 'segments', segs))
+
+                self.win.feed_pool.submit(work)
+
+    def _skip_sponsor(self, t):
+        for start, end, cat in self.segments:
+            if start <= t < end - 0.5 and (start, end) not in self._skipped:
+                self._skipped.add((start, end))  # once: seeking back into it plays it
+                try:
+                    self.engine.m.command('seek', end, 'absolute', 'exact')
+                except Exception:  # noqa: BLE001
+                    return
+                self.win.toast(f'Skipped {SB_CATEGORIES.get(cat, cat)} ({round(end - start)} s) · SponsorBlock')
+                return
+
+    def screenshot(self):
+        """The current frame as a PNG in Pictures/Smedio (S)."""
+        if self.video is None or self.engine.m.idle_active:
+            return
+        folder = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+                              or os.path.expanduser('~/Pictures'), 'Smedio')
+        t = self.engine.m.time_pos or 0
+        name = re.sub(r'[\\/:*?"<>|]+', ' ', self.video.title or 'Smedio').strip()[:80] or 'Smedio'
+        path = os.path.join(folder, f'{name} {(fmt_duration(t) or "0:00").replace(":", ".")}.png')
+        try:
+            os.makedirs(folder, exist_ok=True)
+            self.engine.m.command('screenshot-to-file', path, 'video')
+        except Exception as e:  # noqa: BLE001
+            self.win.toast(f'Couldn’t save a screenshot: {clean_error(e)}')
+            return
+        self.win.toast(f'Screenshot saved in {folder}')
 
     # ---- player controls ----------------------------------------------------------
     def toggle_pause(self):
@@ -3026,6 +3153,7 @@ class WatchPage(Adw.NavigationPage):
         m = Gio.Menu()
         m.append('Hide stats for nerds' if self.stats.src else 'Stats for nerds', 'watch.stats')
         m.append('Loop: on' if self.engine.m.loop_file in ('inf', True) else 'Loop', 'watch.loop')
+        m.append('Save a screenshot (S)', 'watch.screenshot')
         if self._live():
             m.append('Copy stream link', 'watch.copy')
         else:
@@ -4335,8 +4463,7 @@ flowboxchild.tl-row .tl-title {{ font-size: 0.95em; }}
 .tl-volume slider {{ min-width: 5px; min-height: 15px; margin: -6px -2px; border-radius: 1px; border: none;
                     background-color: white; box-shadow: none; outline: none; }}
 .tl-time {{ color: #e8e8e8; font-feature-settings: "tnum"; font-size: 0.92em; margin: 0 10px; }}
-.tl-brand {{ color: white; font-family: "Liberation Sans Narrow", "Nimbus Sans Narrow", "DejaVu Sans Condensed",
-            sans-serif; font-weight: bold; font-size: 15px; margin: 0 8px; }}
+.tl-brand {{ color: white; font-weight: 800; font-size: 14px; letter-spacing: -0.3px; margin: 0 8px; }}
 .tl-stats {{ background-color: rgba(28,28,28,0.82); color: #f0f0f0; padding: 8px 12px; border-radius: 4px;
              font-family: "DejaVu Sans Mono", monospace; font-size: 11.5px; }}
 .tl-stats-title {{ font-weight: bold; font-size: 12px; }}
@@ -4347,8 +4474,8 @@ flowboxchild.tl-row .tl-title {{ font-size: 0.95em; }}
 .tl-stats-btn:checked {{ color: #7fd4ff; }}
 .tl-stats-bar trough {{ min-height: 8px; background-color: rgba(255,255,255,0.15); border-radius: 0; border: none; }}
 .tl-stats-bar block.filled {{ background-color: #7fd4ff; border-radius: 0; }}
-.tl-logo {{ font-family: "Liberation Sans Narrow", "Nimbus Sans Narrow", "DejaVu Sans Condensed", sans-serif;
-           font-weight: bold; font-size: 19px; padding: 2px 6px; letter-spacing: -0.5px; }}
+.tl-logo {{ padding: 2px 6px; }}
+.tl-logo-name {{ font-weight: 800; font-size: 18px; letter-spacing: -0.4px; }}
 .tl-fs-title {{ color: white; font-size: 1.15em; font-weight: bold; padding: 14px 18px 30px 18px;
                background-image: linear-gradient(to top, rgba(0,0,0,0), rgba(0,0,0,0.8)); }}
 
@@ -4483,8 +4610,11 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         self._build_sidebar()
         sidebar_view = Adw.ToolbarView(content=Gtk.ScrolledWindow(child=self.sidebar_box,
                                                                   hscrollbar_policy=Gtk.PolicyType.NEVER))
-        logo_box = Gtk.Box(spacing=6)
-        logo_box.append(Gtk.Label(use_markup=True, label=f'S<span background="{YT_RED}" foreground="white"> medio </span>'))
+        logo_box = Gtk.Box(spacing=8)
+        logo_box.append(logo_image(24))
+        name = Gtk.Label(label='Smedio')
+        name.add_css_class('tl-logo-name')
+        logo_box.append(name)
         logo = Gtk.Button(child=logo_box, tooltip_text='Home')
         logo.add_css_class('flat')
         logo.add_css_class('tl-logo')
@@ -4518,7 +4648,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
     @staticmethod
     def _load_config():
         cfg = {'quality': 720, 'audio_only': False, 'inapp': True, 'fullscreen': False, 'hover_preview': True,
-               'preload_previews': False, 'browser': None, 'download_dir': DEFAULT_DOWNLOAD_DIR, 'volume': 100,
+               'preload_previews': False, 'sponsorblock': True, 'browser': None, 'download_dir': DEFAULT_DOWNLOAD_DIR, 'volume': 100,
                'iptv': [], 'iptv_source': IPTV_DEFAULT, 'iptv_all': False, 'list_order': {},
                'theme': 'system', 'yt_captions': ''}
         try:
@@ -5135,7 +5265,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
                    'Up': lambda: w.set_volume((self.engine.m.volume or 0) + 5),
                    'Down': lambda: w.set_volume((self.engine.m.volume or 0) - 5), 'i': w.stats.toggle,
                    'Page_Up': lambda: self.zap(-1), 'Page_Down': lambda: self.zap(1),
-                   'z': lambda: w.shift_subs(-0.1), 'x': lambda: w.shift_subs(0.1)}
+                   'z': lambda: w.shift_subs(-0.1), 'x': lambda: w.shift_subs(0.1), 's': w.screenshot}
         if name == 'Escape' and w.is_fullscreen:
             w.set_fullscreen(False)
             return True
@@ -5661,6 +5791,9 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         switch(g, 'Preload visible videos', 'Looks up on-screen videos in advance so previews and clicks start '
                'instantly. Uses about 0.5 MB per video — best on Wi-Fi, not on a phone hotspot',
                'preload_previews')
+        switch(g, 'Skip sponsors (SponsorBlock)', 'Skips sponsor segments, self-promotion and subscribe reminders '
+               'that SponsorBlock users marked. Asked by a hash prefix: the server can’t tell which video you watch',
+               'sponsorblock')
         page.add(g)
 
         g = Adw.PreferencesGroup(
