@@ -122,6 +122,8 @@ LIST_FIRST = 72   # cards shown at first on long lists; more as you scroll
 QUEUE_MAX = 200   # videos lined up after the one you click in a list
 THUMB_W, THUMB_H = 240, 135
 GRID_COLUMNS = ((None, 499, 1), (500, 749, 2), (750, 1099, 3))  # page width (px) -> cards a row; wider: 4
+ROW_W, ROW_H = 168, 94  # Up next beside the player: a small thumbnail with the text to its right
+WATCH_W, SIDE_W = 1100, 380  # the player column's width at most; Up next's column next to it
 SHORT_W, SHORT_H = 162, 288
 RESOLVE_TTL = 20 * 60   # stream URLs stay valid for hours; keep lookups for 20 min
 PREVIEW_TTL = 60 * 60
@@ -1938,19 +1940,19 @@ class Thumb(Gtk.Picture):
 
 
 class Card(Gtk.FlowBoxChild):
-    def __init__(self, video, win, page=None, vertical=False, fluid=False):
+    def __init__(self, video, win, page=None, vertical=False, fluid=False, row=False):
         live = video.kind == 'live'
         # fluid: 16:9 cards as wide as the grid's column (channel logos and Shorts keep their size)
-        self.fluid = fluid and not (live or vertical)
-        super().__init__(halign=Gtk.Align.FILL if self.fluid else Gtk.Align.CENTER, valign=Gtk.Align.START)
+        self.fluid = fluid and not (live or vertical or row)
+        super().__init__(halign=Gtk.Align.FILL if self.fluid or row else Gtk.Align.CENTER, valign=Gtk.Align.START)
         self.video, self.win, self.page, self.vertical = video, win, page, vertical
         self.texture = None
         self._hover = False
         self.add_css_class('tl-card')
         self.set_tooltip_text(video.title)
 
-        self.thumb = Thumb(*((LIVE_W, LIVE_H) if live else
-                             (SHORT_W, SHORT_H) if vertical else (THUMB_W, THUMB_H)), fluid=self.fluid)
+        self.thumb = Thumb(*((LIVE_W, LIVE_H) if live else (SHORT_W, SHORT_H) if vertical else
+                             (ROW_W, ROW_H) if row else (THUMB_W, THUMB_H)), fluid=self.fluid)
         if video.kind in ('channel', 'live'):
             self.thumb.set_content_fit(Gtk.ContentFit.CONTAIN)
         if live:
@@ -1985,10 +1987,20 @@ class Card(Gtk.FlowBoxChild):
                          max_width_chars=1, hexpand=True)
         meta.add_css_class('dim-label')
         meta.add_css_class('caption')
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.append(overlay)
-        box.append(title)
-        box.append(meta)
+        if row:  # thumbnail on the left, the text beside it (Up next)
+            meta.set_properties(wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.START)
+            text.append(title)
+            text.append(meta)
+            box = Gtk.Box(spacing=10)
+            box.append(overlay)
+            box.append(text)
+            self.add_css_class('tl-row')
+        else:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.append(overlay)
+            box.append(title)
+            box.append(meta)
         self.set_child(box)
         self.insert_action_group('card', self._actions())
 
@@ -2667,15 +2679,39 @@ class WatchPage(Adw.NavigationPage):
 
         self.info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=14, margin_bottom=24,
                             margin_start=6, margin_end=6)
-        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
         self.body.append(self.player)
         self.body.append(self.info)
-        self.clamp = Adw.Clamp(maximum_size=1100, child=self.body, margin_start=12, margin_end=12, margin_top=8)
+        # Up next (YouTube) or more channels (live TV): a column beside the player on wide windows,
+        # below the details on narrow ones; hidden in fullscreen and for movies.
+        self.side_title = Gtk.Label(xalign=0)
+        self.side_title.add_css_class('title-4')
+        self.side_spinner = Adw.Spinner(width_request=32, height_request=32, visible=False)
+        self.related = Gtk.FlowBox(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
+                                   activate_on_single_click=True, min_children_per_line=1, max_children_per_line=1,
+                                   column_spacing=6, row_spacing=2, valign=Gtk.Align.START)
+        self.related.connect('child-activated', lambda _f, card: win.activate_card(card))
+        self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=SIDE_W,
+                            hexpand=False, valign=Gtk.Align.START, margin_bottom=24, visible=False)
+        for w in (self.side_title, self.side_spinner, self.related):
+            self.side.append(w)
+        self._side_on = False
+        self.columns = Gtk.Box(spacing=18)
+        self.columns.append(self.body)
+        self.columns.append(self.side)
+        self.clamp = Adw.Clamp(maximum_size=WATCH_W, child=self.columns, margin_start=12, margin_end=12,
+                               margin_top=8)
         self.scroller = Gtk.ScrolledWindow(child=self.clamp, hscrollbar_policy=Gtk.PolicyType.NEVER)
         self._start_details = None
         self.scroller.get_vadjustment().connect(
             'value-changed', lambda adj: adj.get_value() > 40 and self._start_details and self._start_details())
-        self.set_child(self.scroller)
+        bin_ = Adw.BreakpointBin(child=self.scroller, width_request=300, height_request=200)
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(f'max-width: {WATCH_W - 100}px'))
+        narrow.add_setter(self.columns, 'orientation', Gtk.Orientation.VERTICAL)
+        narrow.add_setter(self.side, 'width-request', -1)
+        narrow.add_setter(self.related, 'max-children-per-line', 2)
+        bin_.add_breakpoint(narrow)
+        self.set_child(bin_)
 
         group = Gio.SimpleActionGroup()
         for name, cb in (('download', lambda: win.download(self.video)),
@@ -2805,7 +2841,7 @@ class WatchPage(Adw.NavigationPage):
         self.info.set_visible(not on)
         self.area.fill = on
         self.area.set_vexpand(on)
-        self.clamp.set_maximum_size(100000 if on else 1100)
+        self.show_side(self._side_on)
         for side in ('start', 'end', 'top'):
             getattr(self.clamp, f'set_margin_{side}')(0 if on else (8 if side == 'top' else 12))
         self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER if on else Gtk.PolicyType.AUTOMATIC)
@@ -2814,6 +2850,14 @@ class WatchPage(Adw.NavigationPage):
         self.win.set_immersive(on)
         self.area.queue_resize()
         self.poke()
+
+    def show_side(self, on):
+        """Up next beside the player (it widens the page so the player keeps its size)."""
+        self._side_on = on
+        self.side.set_visible(on and not self.is_fullscreen)
+        width = 100000 if self.is_fullscreen else WATCH_W + 18 + SIDE_W if on else WATCH_W
+        self.clamp.set_maximum_size(width)
+        self.clamp.set_tightening_threshold(width)  # full width up to that, no gradual narrowing
 
     def _on_motion(self, _ctl, x, y):
         # GTK sends a synthetic motion event when the bar hides; only real movement should wake it.
@@ -3076,6 +3120,9 @@ class WatchPage(Adw.NavigationPage):
         win, lib, gen = self.win, self.win.lib, self._gen
         while (child := self.info.get_first_child()):
             self.info.remove(child)
+        self.related.remove_all()
+        self.side_spinner.set_visible(False)
+        self.show_side(False)
         if video.kind == 'file':  # a downloaded file: nothing to look up online
             title = Gtk.Label(label=video.title, xalign=0, wrap=True)
             title.add_css_class('title-3')
@@ -3128,16 +3175,9 @@ class WatchPage(Adw.NavigationPage):
         self.desc_expander = Gtk.Expander(label='Description', child=self.desc, visible=False)
         self.info.append(self.desc_expander)
 
-        upnext = Gtk.Label(label='Up next', xalign=0)
-        upnext.add_css_class('title-4')
-        self.info.append(upnext)
-        self.related = Gtk.FlowBox(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE,
-                                   activate_on_single_click=True, max_children_per_line=6,
-                                   column_spacing=6, row_spacing=10, valign=Gtk.Align.START)
-        self.related.connect('child-activated', lambda _f, card: win.activate_card(card))
-        related_spinner = Adw.Spinner(width_request=32, height_request=32, visible=False)
-        self.info.append(related_spinner)
-        self.info.append(self.related)
+        self.side_title.set_label('Up next')
+        self.side_spinner.set_visible(True)  # the list comes a few seconds after the video starts
+        self.show_side(True)
 
         self.comments_label = Gtk.Label(label='Comments', xalign=0)
         self.comments_label.add_css_class('title-4')
@@ -3160,13 +3200,13 @@ class WatchPage(Adw.NavigationPage):
         def show_related(items):
             if gen != self._gen:
                 return
-            related_spinner.set_visible(False)
-            upnext.set_visible(bool(items))
+            self.side_spinner.set_visible(False)
             hidden_v, _ = lib.hidden()
+            self.show_side(any(v.id not in hidden_v for v in items))
 
             def add_card(v):
                 if gen == self._gen:
-                    card = Card(v, win)
+                    card = Card(v, win, row=True)
                     self.related.append(card)
                     win.load_thumb(card)
 
@@ -3247,7 +3287,6 @@ class WatchPage(Adw.NavigationPage):
         # a few seconds; comments (a second full YouTube lookup) only when you scroll down to them.
         def start_related():
             if gen == self._gen:
-                related_spinner.set_visible(True)
                 win.feed_pool.submit(related_work)
             return GLib.SOURCE_REMOVE
 
@@ -3336,18 +3375,13 @@ class WatchPage(Adw.NavigationPage):
             ids = [s.id for s in siblings]
             i = ids.index(video.id) if video.id in ids else 0
             nearby = (siblings[i + 1:] + siblings[:i])[:24]
-            label = Gtk.Label(label='More channels', xalign=0)
-            label.add_css_class('title-4')
-            self.info.append(label)
-            grid = Gtk.FlowBox(homogeneous=True, selection_mode=Gtk.SelectionMode.NONE, activate_on_single_click=True,
-                               max_children_per_line=8, column_spacing=6, row_spacing=10, valign=Gtk.Align.START)
-            grid.connect('child-activated', lambda _f, card: win.activate_card(card))
-            self.info.append(grid)
+            self.side_title.set_label('More channels')
+            self.show_side(True)
 
             def add(v):
                 if gen == self._gen:
-                    card = Card(v, win)
-                    grid.append(card)
+                    card = Card(v, win, row=True)
+                    self.related.append(card)
                     win.load_thumb(card)
 
             GLib.timeout_add_seconds(3, lambda: (in_batches(nearby, add, 4), False)[1])  # after the stream starts
@@ -4145,6 +4179,8 @@ CSS = f"""
 .tl-subscribe {{ background-color: {YT_RED}; color: white; }}
 flowboxchild.tl-card {{ padding: 6px; border-radius: 14px; }}
 flowboxchild.tl-card:hover {{ background-color: alpha(currentColor, 0.06); }}
+flowboxchild.tl-row {{ padding: 4px; border-radius: 10px; }}
+flowboxchild.tl-row .tl-title {{ font-size: 0.95em; }}
 
 /* 2012-style player */
 .tl-player {{ background-color: black; border-radius: 0; }}
