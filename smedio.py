@@ -3,8 +3,9 @@
 
 Everything plays inside the window through an embedded libmpv with hardware decoding (VA-API on
 PCs, V4L2 on ARM tablets and phones such as Qualcomm's Venus), and only in formats the hardware
-decodes: older Intel GPUs (e.g. HD 520 / Skylake) handle H.264 and 8-bit HEVC but not VP9, AV1 or
-10-bit video, which then stutter on the CPU; where the V4L2 decoder takes VP9, YouTube uses it.
+decodes, asked once at start (hw_decoders): older Intel GPUs (e.g. HD 520 / Skylake) handle H.264
+and 8-bit HEVC, newer ones and many ARM decoders VP9 and AV1 too, which YouTube then uses (up to
+4K); anything else would stutter on the CPU.
 
   * YouTube, ad-free and limited to formats the hardware decodes. Two ways to use it:
     - Local library: subscriptions, likes, playlists and history live in a SQLite file on this
@@ -75,7 +76,7 @@ DEFAULT_DOWNLOAD_DIR = os.path.join(
     GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS) or os.path.expanduser('~/Videos'),
     'Smedio')
 
-QUALITIES = [360, 480, 720, 1080]
+QUALITIES = [360, 480, 720, 1080]  # 1440p and 2160p too where the hardware decodes VP9 or AV1: see qualities()
 SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 # The YouTube captions language the viewer picked last (a YouTube code like 'en'; '' = off). The
 # players add that track to every YouTube video that has it.
@@ -160,6 +161,61 @@ lyrics lyric audio trailer shorts short vs best top ep hindi english telugu tami
 HWDEC = 'vaapi,vaapi-copy,v4l2m2m-copy,auto-safe'
 
 
+# Smedio asks the hardware once which codecs it decodes and picks YouTube formats from those, so the CPU never has to decode video. YouTube sends H.264 up to 1080p, VP9 and AV1
+# up to 4K; older GPUs decode only H.264.
+
+# VA-API profile numbers (va.h) -> codec; only the ones YouTube and video releases use
+VA_PROFILES = {0: 'mpeg2', 1: 'mpeg2', 5: 'h264', 6: 'h264', 7: 'h264', 13: 'h264', 14: 'vp8',
+               17: 'hevc', 18: 'hevc10', 19: 'vp9', 21: 'vp9-10', 32: 'av1'}
+
+
+def vaapi_decoders():
+    """(codecs, driver name) the GPU decodes through VA-API (Intel, AMD), asked like vainfo does."""
+    try:
+        va, drm = ctypes.CDLL('libva.so.2'), ctypes.CDLL('libva-drm.so.2')
+    except OSError:
+        return set(), None
+    vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
+    drm.vaGetDisplayDRM.restype, drm.vaGetDisplayDRM.argtypes = vp, [ctypes.c_int]
+    va.vaSetInfoCallback.argtypes = [vp, vp, vp]
+    va.vaInitialize.argtypes = [vp, ip, ip]
+    va.vaMaxNumProfiles.argtypes = va.vaMaxNumEntrypoints.argtypes = va.vaTerminate.argtypes = [vp]
+    va.vaQueryConfigProfiles.argtypes = [vp, ip, ip]
+    va.vaQueryConfigEntrypoints.argtypes = [vp, ctypes.c_int, ip, ip]
+    va.vaQueryVendorString.restype, va.vaQueryVendorString.argtypes = ctypes.c_char_p, [vp]
+    for node in sorted(glob.glob('/dev/dri/renderD*')):
+        try:
+            fd = os.open(node, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            dpy = drm.vaGetDisplayDRM(fd)
+            if not dpy:
+                continue
+            va.vaSetInfoCallback(dpy, None, None)  # no "libva info: ..." lines on the terminal
+            major, minor = ctypes.c_int(), ctypes.c_int()
+            if va.vaInitialize(dpy, ctypes.byref(major), ctypes.byref(minor)) != 0:
+                continue
+            try:
+                n = ctypes.c_int()
+                profiles = (ctypes.c_int * max(va.vaMaxNumProfiles(dpy), 1))()
+                va.vaQueryConfigProfiles(dpy, profiles, ctypes.byref(n))
+                found = set()
+                entry = (ctypes.c_int * max(va.vaMaxNumEntrypoints(dpy), 1))()
+                for p in profiles[:n.value]:
+                    m = ctypes.c_int()
+                    if p in VA_PROFILES and va.vaQueryConfigEntrypoints(dpy, p, entry, ctypes.byref(m)) == 0 \
+                            and 1 in entry[:m.value]:  # VAEntrypointVLD: decoding
+                        found.add(VA_PROFILES[p])
+                name = (va.vaQueryVendorString(dpy) or b'').decode(errors='replace')
+                return found, re.sub(r'\s*\(\)$', '', name) or 'VA-API'  # 'Intel iHD driver … - 26.1.2 ()'
+            finally:
+                va.vaTerminate(dpy)
+        finally:
+            os.close(fd)
+    return set(), None
+
+
 def v4l2_decoder_formats():
     """The compressed formats (fourccs such as 'H264', 'VP90') that the V4L2 mem2mem decoders of
     this machine take, read from the kernel. Empty on PCs, which decode through VA-API."""
@@ -193,23 +249,49 @@ def v4l2_decoder_formats():
     return found
 
 
-HW_FORMATS = v4l2_decoder_formats()
+V4L2_CODECS = {'H264': 'h264', 'HEVC': 'hevc', 'VP90': 'vp9', 'AV1F': 'av1', 'VP80': 'vp8', 'MPG2': 'mpeg2'}
+CODEC_NAMES = {'h264': 'H.264', 'hevc': 'HEVC', 'hevc10': 'HEVC 10-bit', 'vp9': 'VP9', 'vp9-10': 'VP9 10-bit',
+               'av1': 'AV1', 'vp8': 'VP8', 'mpeg2': 'MPEG-2'}
+ASSUMED_CODECS = {'h264', 'hevc'}  # when the hardware can't be asked (e.g. NVIDIA's own driver)
+_HW = None
+
+
+def hw_decoders():
+    """(codecs, how they were found): VA-API on PCs, V4L2 mem2mem decoders on ARM boards.
+    Asked once per process (~10 ms)."""
+    global _HW
+    if _HW is None:
+        codecs, how = vaapi_decoders()
+        if not codecs:
+            codecs = {V4L2_CODECS[f] for f in v4l2_decoder_formats() if f in V4L2_CODECS}
+            how = 'V4L2 video decoder' if codecs else None
+        _HW = (codecs, how) if codecs else (set(ASSUMED_CODECS), None)
+    return _HW
+
+
+def hw_codecs():
+    return hw_decoders()[0]
+
+
+def qualities():
+    """The quality menu: above 1080p YouTube has only VP9 and AV1."""
+    return QUALITIES + ([1440, 2160] if hw_codecs() & {'vp9', 'av1'} else [])
 
 
 def video_format(height, playback=True):
-    # Codecs the hardware decodes first, anything else only as a last resort: H.264 (avc1) + AAC
-    # everywhere (VA-API on older GPUs decodes nothing else YouTube sends), and for playback VP9
-    # first where the V4L2 decoder takes it (better quality at the same size). Downloads stay
-    # H.264 + AAC, which every player opens (they are merged into MP4). Never AV1 by choice.
-    # Vertical videos (Shorts) are limited by their short side, so "1080p" means 1080x1920.
+    """yt-dlp's format choice: the best codec the GPU decodes (AV1, then VP9, both 8-bit SDR), then
+    H.264 + AAC, anything else only as a last resort. Downloads (playback=False) stay H.264 + AAC,
+    which every player opens. Vertical videos (Shorts) are limited by their short side, so
+    "1080p" means 1080x1920."""
+    codecs = hw_codecs() if playback else set()
     sel = []
-    if playback and 'VP90' in HW_FORMATS:
-        sel += [f'bv*[vcodec^=vp09][aspect_ratio<1][width<={height}]+ba',
-                f'bv*[vcodec^=vp09][height<={height}]+ba']
+    for key, vc in (('av1', 'av01'), ('vp9', 'vp9'), ('vp9', 'vp09.00')):  # DASH ('vp9') before HLS
+        if key in codecs:
+            sel += [f'bv*[vcodec^={vc}][dynamic_range=SDR][aspect_ratio<1][width<={height}]+ba',
+                    f'bv*[vcodec^={vc}][dynamic_range=SDR][height<={height}]+ba']
     sel += [f'bv*[vcodec^=avc1][aspect_ratio<1][width<={height}]+ba[ext=m4a]',
             f'bv*[vcodec^=avc1][height<={height}]+ba[ext=m4a]', f'b[vcodec^=avc1][height<={height}]',
-            f'bv*[height<={height}][vcodec!^=av01]+ba', f'bv*[height<={height}]+ba', f'b[height<={height}]',
-            'b']
+            f'bv*[height<={height}]+ba', f'b[height<={height}]', 'b']
     return '/'.join(sel)
 
 
@@ -837,7 +919,8 @@ def parse_related(data):
 
 
 def summarize_formats(info):
-    """H.264 qualities with approximate download sizes (video + best AAC audio)."""
+    """The qualities in codecs the GPU decodes, with approximate download sizes (video + best AAC
+    audio)."""
     fmts = info.get('formats') or []
 
     def size(f):
@@ -845,9 +928,11 @@ def summarize_formats(info):
 
     audio = max((f for f in fmts if f.get('vcodec') == 'none' and f.get('ext') == 'm4a'),
                 key=lambda f: f.get('abr') or 0, default=None)
-    best = {}
+    best, codecs = {}, hw_codecs()
+    ok = ('avc1',) + (('vp9', 'vp09.00') if 'vp9' in codecs else ()) + (('av01',) if 'av1' in codecs else ())
     for f in fmts:
-        if (f.get('vcodec') or '').startswith('avc1') and f.get('acodec') == 'none' and f.get('height'):
+        if (f.get('vcodec') or '').startswith(ok) and f.get('dynamic_range') in (None, 'SDR') \
+                and f.get('acodec') == 'none' and f.get('height'):
             h = min(f['height'], f.get('width') or f['height'])  # quality = short side
             if h not in best or size(f) > size(best[h]):
                 best[h] = f
@@ -2970,7 +3055,7 @@ class WatchPage(Adw.NavigationPage):
 
     def _quality_items(self, pop):
         box = self._menu_box('Quality')
-        heights = [v['height'] for v in (self.stream or {}).get('formats', {}).get('video', [])] or QUALITIES[::-1]
+        heights = [v['height'] for v in (self.stream or {}).get('formats', {}).get('video', [])] or qualities()[::-1]
         vp = self.engine.m.video_params or {}
         current = min(vp.get('w') or 0, vp.get('h') or 0) or self.engine.m.height  # short side, like the labels
         audio_mode = self.win.config['audio_only']
@@ -3015,7 +3100,7 @@ class WatchPage(Adw.NavigationPage):
         live = self._live()
         box = self._menu_box('Quality' if live else 'Subtitles')
         if live:
-            for h in QUALITIES[::-1]:
+            for h in qualities()[::-1]:
                 self._menu_item(box, f'Up to {h}p', lambda h=h: self.win.set_live_quality(h),
                                 current=self.win.config['quality'] == h, popover=pop)
             sources = self.win.live_sources(self.video)
@@ -4308,9 +4393,9 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         self.add_action(theme)
         Adw.StyleManager.get_default().connect('notify::dark', lambda *_: self._update_theme_button())
         self.set_theme(self.config['theme'])
-        self.quality = Gtk.DropDown.new_from_strings([f'{q}p' for q in QUALITIES])
+        self.quality = Gtk.DropDown.new_from_strings([f'{q}p' for q in qualities()])
         self.quality.set_tooltip_text('Video quality (H.264, GPU decoded)')
-        self.quality.set_selected(QUALITIES.index(self.config['quality']))
+        self.quality.set_selected(qualities().index(self.config['quality']))
         self.quality.connect('notify::selected', self._on_settings_changed)
         header.pack_end(self.quality)
 
@@ -4393,7 +4478,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
                 cfg.update(json.load(f))
         except (OSError, ValueError):
             pass
-        if cfg['quality'] not in QUALITIES:
+        if cfg['quality'] not in qualities():
             cfg['quality'] = 720
         if cfg['browser'] not in BROWSERS:
             cfg['browser'] = None
@@ -4408,7 +4493,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
             pass
 
     def _on_settings_changed(self, *_):
-        self.config['quality'] = QUALITIES[self.quality.get_selected()]
+        self.config['quality'] = qualities()[self.quality.get_selected()]
         self.config['audio_only'] = self.audio_btn.get_active()
         self.save_config()
 
@@ -5147,8 +5232,8 @@ class Window(LiveMixin, Adw.ApplicationWindow):
             self.audio_btn.set_active(True)
         else:
             self.audio_btn.set_active(False)
-            self.quality.set_selected(QUALITIES.index(height) if height in QUALITIES else
-                                      max(i for i, q in enumerate(QUALITIES) if q <= max(height, 360)))
+            self.quality.set_selected(qualities().index(height) if height in qualities() else
+                                      max(i for i, q in enumerate(qualities()) if q <= max(height, 360)))
         video = self.watch.video if self.watch else None
         if not video:
             return
@@ -5228,7 +5313,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
             self.toast(f'Removed from {label}')
 
     def set_live_quality(self, height):
-        self.quality.set_selected(QUALITIES.index(height))  # saved like the header's quality menu
+        self.quality.set_selected(qualities().index(height))  # saved like the header's quality menu
         nl = self.now_live
         if nl:
             self.play_live(nl['video'], nl['siblings'], nl['alt'])
@@ -5513,6 +5598,13 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         g = Adw.PreferencesGroup(title='Playback')
         switch(g, 'Play inside Smedio', 'Off: use a separate mpv window instead', 'inapp')
         switch(g, 'Start videos fullscreen', 'F toggles fullscreen, Esc leaves it', 'fullscreen')
+        codecs, how = hw_decoders()
+        names = ', '.join(CODEC_NAMES[c] for c in CODEC_NAMES if c in codecs)
+        g.add(Adw.ActionRow(
+            title='Hardware video decoding',
+            subtitle=(f'{names} — asked from {how}. YouTube videos are picked in these formats.' if how else
+                      f'Couldn’t ask the GPU (no VA-API or V4L2 decoder found); assuming {names}.'),
+            subtitle_selectable=True))
         switch(g, 'Preview videos on hover', 'Plays a muted 360p clip inside the thumbnail', 'hover_preview')
         switch(g, 'Preload visible videos', 'Looks up on-screen videos in advance so previews and clicks start '
                'instantly. Uses about 0.5 MB per video — best on Wi-Fi, not on a phone hotspot',
