@@ -384,6 +384,29 @@ def fetch_image(urls, path):
             return None
     return Gdk.Texture.new_from_filename(path)
 
+
+def cover_art(video):
+    """The video's cached thumbnail cut to 16:9 for mpv's audio-only picture (YouTube's 480x360
+    one has black bars above and below), or None if there is no thumbnail yet."""
+    src = video.thumb_path()
+    if not os.path.exists(src):
+        return None
+    dst = src[:-4] + '_cover.jpg'
+    if os.path.exists(dst):
+        return dst
+    try:
+        gi.require_version('GdkPixbuf', '2.0')
+        from gi.repository import GdkPixbuf
+        pb = GdkPixbuf.Pixbuf.new_from_file(src)
+        w, h = pb.get_width(), pb.get_height()
+        ch = min(h, round(w * 9 / 16))
+        if ch == h:
+            return src
+        pb.new_subpixbuf(0, (h - ch) // 2, w, ch).savev(dst, 'jpeg', ['quality'], ['92'])
+        return dst
+    except Exception:  # noqa: BLE001 - the uncropped picture will do
+        return src
+
 # ---------------------------------------------------------------- formatting
 
 
@@ -4171,7 +4194,7 @@ LOCAL_SECTIONS = [('l:foryou', 'For you', 'starred-symbolic'), ('shorts', 'Short
 
 class Window(LiveMixin, Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title='Smedio', default_width=1180, default_height=740)
+        super().__init__(application=app, title='Smedio', default_width=1180, default_height=740, maximized=True)
         self.set_size_request(400, 360)
         self.app = app
         self.config = self._load_config()
@@ -4990,7 +5013,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         self.show_watch()
         if self.config['fullscreen'] and not self.watch.is_fullscreen:
             self.watch.set_fullscreen(True)
-        cover = video.thumb_path() if audio and os.path.exists(video.thumb_path()) else None
+        cover = cover_art(video) if audio else None
         self.upcoming, self._inflight = list(playlist or []), 0
         self.play_pool.submit(self._play_worker, video, fmt, fut, gen, cover, quick, playlist or [])
         return fut
@@ -5100,7 +5123,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
                 return
             idle(self.watch.set_stream, video, stream)
             if height is None:
-                cover = video.thumb_path() if os.path.exists(video.thumb_path()) else None
+                cover = cover_art(video)
                 self.engine.load_stream(stream, 'replace', cover, start=self.engine.m.time_pos or pos)
             else:
                 self.engine.swap_video(None, stream)
