@@ -8,7 +8,9 @@ One lightweight Linux app for low-end laptops and ARM tablets. It plays only
 formats your hardware decodes, so video stays smooth on machines where a
 browser stutters.
 
-![Smedio](docs/screenshot.png)
+![Smedio playing a video, with Up next beside the player](docs/screenshot.png)
+
+![Search results in Smedio's YouTube-style grid](docs/screenshot-grid.png)
 
 ## Features
 
