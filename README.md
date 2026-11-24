@@ -1,8 +1,12 @@
 # Smedio
 
-YouTube and live TV in one lightweight Linux app, for low-end laptops and ARM
-tablets. Ad-free, and it plays only formats your hardware decodes, so video
-stays smooth on machines where a browser stutters.
+**Your GPU decodes, your CPU rests.** Smooth YouTube and live TV even on a
+10-year-old laptop: Smedio checks what your GPU can decode (VA-API, V4L2) and
+picks AV1, VP9 or H.264 to match. Ad-free, no account, no Electron.
+
+One lightweight Linux app for low-end laptops and ARM tablets. It plays only
+formats your hardware decodes, so video stays smooth on machines where a
+browser stutters.
 
 ![Smedio](docs/screenshot.png)
 
