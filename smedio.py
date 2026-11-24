@@ -2750,15 +2750,17 @@ class WatchPage(Adw.NavigationPage):
     def toggle_pause(self):
         self.engine.m.pause = not self.engine.m.pause
 
+    # Exact, not 'keyframes': YouTube's audio is a separate stream that seeks to the exact time
+    # while the video went back to its keyframe, so the sound stayed off for seconds.
     def seek_to(self, value):
         try:
-            self.engine.m.command('seek', max(0.0, value), 'absolute', 'keyframes')
+            self.engine.m.command('seek', max(0.0, value), 'absolute', 'exact')
         except Exception:  # noqa: BLE001
             pass
 
     def seek_by(self, delta):
         try:
-            self.engine.m.command('seek', delta, 'relative', 'keyframes')
+            self.engine.m.command('seek', delta, 'relative', 'exact')
         except Exception:  # noqa: BLE001
             pass
         self.poke()
