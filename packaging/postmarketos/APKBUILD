@@ -1,7 +1,7 @@
 # Maintainer: psigod <psigod@example.com>
 # Builds the tagged release v$pkgver. New release: tag it, then set pkgver and the checksum here.
 pkgname=smedio
-pkgver=3.5.3
+pkgver=3.6
 pkgrel=0
 pkgdesc="YouTube and live TV, ad-free and hardware-decoded (VA-API, V4L2 video decoders)"
 url="https://github.com/wh1ter0z3/smedio"
@@ -39,5 +39,5 @@ package() {
 	install -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/$pkgname
 }
 sha512sums="
-845c6e344217106a26670c3955cf38768db78953876e904099dcb94532b08703ec4e6b3df91f514a53d4549425dbb09f3ef24f30ce173aba5835d12fc31ccddf  smedio-3.5.3.tar.gz
+3e2e42cdf7c7db7b9fa9ecd4803b7bdf3d5d2882039c73c3ae1abf96396e4235145ed962ef98b9d3fb365ff1a48d1cb07827c706ec50fbe147e8b9d7ecdf0aad  smedio-3.6.tar.gz
 "
