@@ -64,6 +64,8 @@ import gi  # noqa: E402
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GdkPixbuf  # noqa: E402
 
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), 'smedio')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
@@ -953,6 +955,29 @@ def parse_related(data):
     return out
 
 
+def storyboard(info):
+    """YouTube's seek-bar previews (yt-dlp formats sb0-sb3): sprite sheets of rows x cols tiles,
+    one tile every 1/fps seconds. The biggest level up to 320 px wide, or None."""
+    sbs = [f for f in info.get('formats') or [] if (f.get('format_id') or '').startswith('sb')
+           and f.get('fragments') and f.get('rows') and f.get('columns') and f.get('fps') and f.get('width')]
+    sb = max((f for f in sbs if f['width'] <= 320), key=lambda f: f['width'], default=None)
+    if not sb:
+        return None
+    base = sb.get('fragment_base_url') or ''
+    urls = [fr.get('url') or base + (fr.get('path') or '') for fr in sb['fragments']]
+    return {'w': sb['width'], 'h': sb['height'], 'rows': sb['rows'], 'cols': sb['columns'],
+            'fps': sb['fps'], 'urls': [u for u in urls if u]}
+
+
+def storyboard_tile(sb, t):
+    """(sheet number, (x, y, w, h) of the tile in it) for the storyboard picture at time t."""
+    per = sb['rows'] * sb['cols']
+    i = max(0, int(t * sb['fps']))
+    sheet = min(i // per, len(sb['urls']) - 1)
+    k = min(i - sheet * per, per - 1)
+    return sheet, ((k % sb['cols']) * sb['w'], (k // sb['cols']) * sb['h'], sb['w'], sb['h'])
+
+
 def summarize_formats(info):
     """The qualities in codecs the GPU decodes, with approximate download sizes (video + best AAC
     audio)."""
@@ -1148,6 +1173,7 @@ class YouTube:
                          'channel': info.get('channel') or info.get('uploader'), 'channel_id': info.get('channel_id'),
                          'channel_url': info.get('channel_url'), 'duration': info.get('duration')},
                 'preview': preview['url'] if preview else None, 'captions': yt_captions(info),
+                'storyboard': storyboard(info),
                 'chapters': [{'start': c.get('start_time') or 0,  # yt-dlp's '<Untitled Chapter 1>' -> no name
                               'title': '' if (c.get('title') or '').startswith('<Untitled') else c.get('title') or ''}
                              for c in info.get('chapters') or []]}
@@ -2596,10 +2622,13 @@ class ControlBar(Gtk.Box):
                                   show_fill_level=True, restrict_to_fill_level=False, focusable=False)
         self.progress.set_range(0, 1)
         self.progress.add_css_class('tl-progress')
-        self.progress.connect('change-value', lambda _s, _scroll, value: page.seek_to(value) or False)
+        self.progress.connect('change-value', self._progress_changed)
         hover = Gtk.EventControllerMotion()
         hover.connect('motion', self._progress_hover)
+        hover.connect('enter', lambda *_: setattr(self, 'over_bar', True))
+        hover.connect('leave', lambda *_: (setattr(self, 'over_bar', False), page.hide_preview_soon()))
         self.progress.add_controller(hover)
+        self.over_bar = False
         self._chapters = []
         self.chapter_gaps = Gtk.DrawingArea(can_target=False)  # YouTube-style gaps where chapters begin
         self.chapter_gaps.set_draw_func(self._draw_chapter_gaps)
@@ -2670,9 +2699,14 @@ class ControlBar(Gtk.Box):
     def _progress_hover(self, _ctl, x, _y):
         w = self.progress.get_width()
         if self._dur and w:
-            t = max(0.0, min(1.0, x / w)) * self._dur
-            chapter = self.chapter_at(t)
-            self.progress.set_tooltip_text((fmt_duration(t) or '0:00') + (f' · {chapter}' if chapter else ''))
+            self.page.preview_at(x, max(0.0, min(1.0, x / w)) * self._dur)
+
+    def _progress_changed(self, _scale, _scroll, value):
+        """Dragging (or clicking) the bar: seek, and show the preview of where it is."""
+        self.page.seek_to(value)
+        if self._dur:
+            self.page.preview_at(value / self._dur * self.progress.get_width(), value)
+        return False
 
     def update(self, name, value, engine):
         if name == 'time-pos' and value is not None and self.page.video is not None and self.page.video.kind == 'live':
@@ -2884,6 +2918,69 @@ class StatsPanel(Gtk.Box):
         self.bars['buffer'].set_value(min(1.0, buffered / 60))
 
 
+def tile_texture(pb, tile):
+    """One tile of a storyboard sheet (a GdkPixbuf) as a texture over the sheet's own pixels."""
+    x, y, w, h = tile
+    w, h = min(w, pb.get_width()), min(h, pb.get_height())
+    x, y = min(x, pb.get_width() - w), min(y, pb.get_height() - h)  # a short last sheet: its last tile
+    n, stride = pb.get_n_channels(), pb.get_rowstride()
+    sub = GLib.Bytes.new_from_bytes(pb.read_pixel_bytes(), y * stride + x * n, (h - 1) * stride + w * n)
+    fmt = Gdk.MemoryFormat.R8G8B8A8 if pb.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
+    return Gdk.MemoryTexture.new(w, h, fmt, sub, stride)
+
+
+class FrameGrabber:
+    """thumbfast-style seek previews for videos without a storyboard (downloaded files,
+    torrents): a second, hidden libmpv decodes the keyframe nearest the asked time on the CPU,
+    scaled to 320 px, in its own thread, so playback keeps the GPU decoder to itself. Only the
+    latest request counts."""
+
+    def __init__(self, mpvmod):
+        self.mpvmod, self.m, self.url = mpvmod, None, None
+        self.cond, self.want = threading.Condition(), None
+        self.restarted = threading.Event()
+        threading.Thread(target=self._run, daemon=True, name='frame-grabber').start()
+
+    def request(self, url, t, callback):
+        with self.cond:
+            self.want = (url, t, callback)
+            self.cond.notify()
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while self.want is None:
+                    self.cond.wait()
+                url, t, callback = self.want
+                self.want = None
+            try:
+                frame = self._grab(url, t)
+            except Exception:  # noqa: BLE001 - a missing preview is fine
+                frame = None
+            if frame:
+                idle(callback, url, t, frame)
+
+    def _grab(self, url, t):
+        if self.m is None:
+            self.m = self.mpvmod.MPV(vo='null', ao='null', aid='no', sid='no', hwdec='no', pause=True, idle='yes',
+                                     keep_open='always', hr_seek='no', ytdl=False, cache='no',
+                                     demuxer_readahead_secs=0, vf='scale=320:-2', sws_scaler='fast-bilinear',
+                                     vd_lavc_skiploopfilter='all', vd_lavc_fast=True)
+            self.m.event_callback('playback-restart')(lambda _e: self.restarted.set())
+        if url != self.url:
+            self.restarted.clear()
+            self.m.command('loadfile', url)
+            self.url = url
+            if not self.restarted.wait(15):
+                self.url = None
+                return None
+        self.restarted.clear()
+        self.m.command('seek', t, 'absolute+keyframes')
+        self.restarted.wait(5)
+        r = self.m.command('screenshot-raw', 'video')  # (python-mpv's node_command drops the result)
+        return {'w': r['w'], 'h': r['h'], 'stride': r['stride'], 'data': r['data']} if r and r.get('data') else None
+
+
 class WatchColumns(Gtk.Widget):
     """The player column and Up next beside it, fitted to the screen: Up next's thumbnails are as
     tall as lets about UPNEXT_ROWS rows show in the visible height, its column as wide as they
@@ -3008,7 +3105,21 @@ class WatchPage(Adw.NavigationPage):
         self.player = Gtk.Overlay(child=self.area, overflow=Gtk.Overflow.HIDDEN)  # clips to the rounded corners
         self.player.add_css_class('tl-player')
         self.stats = StatsPanel(self)
-        for w in (self.top, self.spinner, self.buffer_label, self.revealer, self.stats):
+        # Seek-bar preview: YouTube's storyboard tile, else a grabbed frame (FrameGrabber), with the time
+        self.preview_pic = Thumb(256, 144)
+        self.preview_frame = Gtk.Box(overflow=Gtk.Overflow.HIDDEN)  # rounded corners
+        self.preview_frame.add_css_class('tl-seek-pic')
+        self.preview_frame.append(self.preview_pic)
+        self.preview_time = Gtk.Label()
+        self.preview_time.add_css_class('tl-seek-time')
+        self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.START,
+                                   valign=Gtk.Align.END, can_target=False, visible=False)
+        self.preview_box.add_css_class('tl-seek-preview')
+        self.preview_box.append(self.preview_frame)
+        self.preview_box.append(self.preview_time)
+        self._sheets, self._grabs, self._preview_t, self._preview_hide = {}, {}, None, 0
+        self.grabber = None
+        for w in (self.top, self.spinner, self.buffer_label, self.revealer, self.stats, self.preview_box):
             self.player.add_overlay(w)
         click = Gtk.GestureClick()
         click.connect('pressed', self._on_video_click)
@@ -3018,6 +3129,7 @@ class WatchPage(Adw.NavigationPage):
         self.area.add_controller(menu_click)
         self.connect('hidden', lambda *_: self._pause_stats(True))
         self.connect('showing', lambda *_: self._pause_stats(False))
+        self.connect('shown', lambda *_: self.take_keys())  # e.g. a search opened this video
         self._stats_was_open = False
         motion = Gtk.EventControllerMotion()
         motion.connect('motion', self._on_motion)
@@ -3115,6 +3227,8 @@ class WatchPage(Adw.NavigationPage):
         self.video, self.stream = video, stream
         self._gen += 1
         self.segments, self._skipped, self._sb_for = [], set(), None
+        self._sheets, self._grabs = {}, {}
+        self.preview_box.set_visible(False)
         self.controls.set_chapters([])
         self.set_title(video.title)
         self.fs_title.set_label(video.title)
@@ -3158,6 +3272,119 @@ class WatchPage(Adw.NavigationPage):
                     idle(lambda: gen == self._gen and setattr(self, 'segments', segs))
 
                 self.win.feed_pool.submit(work)
+
+    # ---- seek-bar preview ----------------------------------------------------------
+    def _preview_source(self):
+        """('sb', storyboard) for YouTube, ('grab', url) for files and torrents, else None."""
+        v = self.video
+        if v is None or v.kind == 'live' or v.live:
+            return None
+        sb = (self.stream or {}).get('storyboard')
+        if sb and sb['urls']:
+            return 'sb', sb
+        if v.kind == 'file' or (v.kind == 'torrent' and not self.win.config.get('save_data', True)):
+            try:
+                url = self.engine.m.path
+            except Exception:  # noqa: BLE001
+                url = None
+            return ('grab', url) if url else None
+        return None  # (data saver on, or YouTube without a storyboard: the time alone)
+
+    def preview_at(self, x, t):
+        """Show the preview above bar position x (progress-bar pixels) for time t."""
+        if self.video is None or self.video.kind == 'live':
+            return
+        bar = self.controls.progress
+        ok, p = bar.compute_point(self.player, Graphene.Point().init(x, 0))
+        if not ok:
+            return
+        src = self._preview_source()
+        self.preview_frame.set_visible(src is not None)
+        chapter = self.controls.chapter_at(t)
+        self.preview_time.set_label((fmt_duration(t) or '0:00') + (f'\n{chapter}' if chapter else ''))
+        self.preview_time.set_max_width_chars(1 if src is not None else -1)
+        width = 256 + 6 if src is not None else self.preview_time.measure(Gtk.Orientation.HORIZONTAL, -1)[1] + 16
+        self.preview_box.set_margin_start(int(max(6, min(p.x - width / 2, self.player.get_width() - width - 6))))
+        self.preview_box.set_margin_bottom(int(max(0, self.player.get_height() - p.y + 10)))
+        self.preview_box.set_visible(True)
+        self._preview_t = t
+        if src is not None and src[0] == 'sb':
+            self._show_tile(src[1], t)
+        elif src is not None:
+            self._show_grab(src[1], t)
+        self.hide_preview_soon(1500)
+
+    def hide_preview_soon(self, delay=200):
+        if self._preview_hide:
+            GLib.source_remove(self._preview_hide)
+        self._preview_hide = GLib.timeout_add(delay, self._hide_preview)
+
+    def _hide_preview(self):
+        self._preview_hide = 0
+        if self.controls.over_bar:  # still hovering: keep it
+            self._preview_hide = GLib.timeout_add(500, self._hide_preview)
+        else:
+            self.preview_box.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def _show_tile(self, sb, t):
+        sheet, tile = storyboard_tile(sb, t)
+        url = sb['urls'][sheet]
+        pb = self._sheets.get(url)
+        if pb == 'failed':
+            return
+        if pb is not None and pb != 'loading':
+            key = (url, tile)
+            if key not in self._grabs:
+                self._grabs[key] = tile_texture(pb, tile)
+            self.preview_pic.set_paintable(self._grabs[key])
+            return
+        if pb is None:  # fetch the sheet once (a JPEG of a few dozen KB)
+            self._sheets[url] = 'loading'
+            gen = self._gen
+
+            def work():
+                try:
+                    data = http_get(url, timeout=10)
+                except OSError:
+                    data = None
+                idle(done, data)
+
+            def done(data):
+                if gen != self._gen:
+                    return
+                try:
+                    stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+                    self._sheets[url] = GdkPixbuf.Pixbuf.new_from_stream(stream, None) if data else 'failed'
+                except (GLib.Error, TypeError):
+                    self._sheets[url] = 'failed'
+                if self._preview_t is not None and self.preview_box.get_visible():
+                    self._show_tile(sb, self._preview_t)
+
+            self.win.thumb_pool.submit(work)
+
+    def _show_grab(self, url, t):
+        key = (url, int(t // 2))
+        tex = self._grabs.get(key)
+        if tex is not None:
+            self.preview_pic.set_paintable(tex)
+            return
+        if self.grabber is None:
+            self.grabber = FrameGrabber(self.engine.mpvmod)
+        gen = self._gen
+
+        def got(src_url, src_t, frame):
+            if gen != self._gen:
+                return
+            tex = Gdk.MemoryTexture.new(frame['w'], frame['h'], Gdk.MemoryFormat.B8G8R8X8,
+                                        GLib.Bytes.new(frame['data']), frame['stride'])
+            if len(self._grabs) > 60:
+                self._grabs.pop(next(iter(self._grabs)))
+            self._grabs[(src_url, int(src_t // 2))] = tex
+            if self._preview_t is not None and abs(self._preview_t - src_t) < 4 and self.preview_box.get_visible():
+                self.preview_pic.set_paintable(tex)
+
+        self.grabber.request(url, t, got)
 
     def _skip_sponsor(self, t):
         for start, end, cat in self.segments:
@@ -3328,7 +3555,15 @@ class WatchPage(Adw.NavigationPage):
                 'text/plain;charset=utf-8', GLib.Bytes.new(f'https://youtu.be/{self.video.id}?t={t}'.encode())))
             self.win.toast(f'Link copied (starts at {fmt_duration(t) or "0:00"})')
 
+    def take_keys(self):
+        """Give the player keys (space, arrows, F…) back: they are ignored while a text field such
+        as the search box has the focus, and it kept it after a search opened a video."""
+        focus = self.win.get_focus()
+        if isinstance(focus, (Gtk.Text, Gtk.Editable)):
+            self.win.set_focus(None)
+
     def _on_video_click(self, gesture, n_press, _x, _y):
+        self.take_keys()
         if n_press == 2:
             self.toggle_fullscreen()
         self.toggle_pause()  # a double-click toggles twice, leaving playback as it was
@@ -4651,6 +4886,9 @@ flowboxchild.tl-card {{ padding: 6px; border-radius: 14px; }}
 flowboxchild.tl-card:hover {{ background-color: alpha(currentColor, 0.06); }}
 flowboxchild.tl-row {{ padding: 4px; border-radius: 10px; }}
 flowboxchild.tl-row .tl-title {{ font-size: 1.2em; font-weight: 700; line-height: 1.2; }}
+.tl-seek-preview {{ background-color: rgba(0, 0, 0, 0.82); border-radius: 9px; padding: 3px 3px 5px 3px; }}
+.tl-seek-pic {{ border-radius: 6px; background-color: black; }}
+.tl-seek-time {{ color: white; font-weight: bold; font-feature-settings: "tnum"; font-size: 0.92em; }}
 .tl-watch-title {{ font-size: 1.7em; font-weight: 800; line-height: 1.25; }}
 
 /* 2012-style player */
@@ -4748,6 +4986,7 @@ class Window(LiveMixin, Adw.ApplicationWindow):
         # Header
         self.entry = Gtk.SearchEntry(placeholder_text='Search YouTube or paste a link', hexpand=True)
         self.entry.connect('activate', self._on_search)
+        self.entry.connect('stop-search', lambda *_: self.set_focus(None))  # Esc: keys back to the player
         self.entry.set_key_capture_widget(self)
         header = Adw.HeaderBar(title_widget=Adw.Clamp(maximum_size=620, child=self.entry))
         self.sidebar_btn = Gtk.ToggleButton(icon_name='sidebar-show-symbolic', tooltip_text='Sidebar', active=True)
